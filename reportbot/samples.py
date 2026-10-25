@@ -39,7 +39,7 @@ def select_reports(candidates: list[Report], session, *, count: int = 5, min_pag
             continue
         identities.add(identity)
         try:
-            if report.source == "naver" and not report.pdf_url:
+            if report.source == "naver" and (not report.pdf_url or naver.is_placeholder_pdf_url(report.pdf_url)):
                 report = replace(report, pdf_url=naver.resolve_pdf_url(session, report))
             decision = classify(report, session, min_pages)
         except Exception as exc:

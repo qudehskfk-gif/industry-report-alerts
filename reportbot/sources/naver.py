@@ -17,6 +17,13 @@ API_URL = "https://stock.naver.com/api/stockSecurity/researches/v2/industry"
 DETAIL_BASE = "https://stock.naver.com/research/industry/"
 
 
+def is_placeholder_pdf_url(url: str | None) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    return parsed.hostname in {"www.shinhansec.com", "shinhansec.com"} and parsed.path.endswith("/research/list/view-popup.do")
+
+
 def _api_result(body):
     if not isinstance(body, dict):
         raise ValueError("NAVER industry API returned an invalid response")
@@ -82,6 +89,10 @@ def resolve_pdf_url(session, report: Report) -> str | None:
     pdf_url = result["attachUrl"] or None
     if pdf_url and (not isinstance(pdf_url, str) or urlparse(pdf_url).scheme not in ("http", "https")):
         raise ValueError("NAVER industry PDF has an invalid URL")
+    if is_placeholder_pdf_url(pdf_url):
+        from .shinhan import resolve_attachment
+
+        pdf_url = resolve_attachment(session, report, result.get("attachName", ""))
     return pdf_url
 
 

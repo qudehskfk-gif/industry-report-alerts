@@ -5,6 +5,7 @@ from .classify import classify, title_rejection
 from .config import Config
 from .http import make_session
 from .sources import hankyung, naver
+from .sources.shinhan import SingleCompanyReport
 from .state import State, title_fingerprint
 from .telegram import Telegram
 
@@ -36,7 +37,7 @@ def discover(config, session, state=None):
 
 
 def resolve(report, session):
-    if report.source == "naver" and not report.pdf_url:
+    if report.source == "naver" and (not report.pdf_url or naver.is_placeholder_pdf_url(report.pdf_url)):
         report = replace(report, pdf_url=naver.resolve_pdf_url(session, report))
     if not report.pdf_url:
         raise ValueError("No attachment yet; keep pending")
@@ -97,6 +98,11 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         state.record(report, "sent", decision.pdf_hash)
                         totals["sent"] += 1
                         log.info("PDF 발송 성공: %s/%s | %s", report.source, report.source_id, report.title)
+                except SingleCompanyReport:
+                    if state is not None:
+                        state.record(report, "rejected: 발행사에서 확인된 개별 기업 리포트")
+                    totals["rejected"] += 1
+                    log.info("개별 기업 자료 제외: %s/%s | %s", report.source, report.source_id, report.title)
                 except Exception as exc:
                     if state is not None:
                         state.record(report, "pending: retry")
