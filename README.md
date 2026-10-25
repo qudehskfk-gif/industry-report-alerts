@@ -6,6 +6,12 @@
 
 두 Telegram Secret 중 하나라도 비어 있으면 자동 실행은 오류 없이 연결 대기 상태로 종료합니다. Actions의 초록색 표시만으로 연결 완료를 판단하지 말고, 두 값을 등록한 뒤 `send_test`로 실제 테스트 메시지 도착을 확인하세요.
 
+## 휴대폰에서 수신자 연결
+
+이미 봇에 `/start`를 보냈고 `TELEGRAM_BOT_TOKEN`을 저장소 Secret으로 등록했다면, Actions의 **Connect Telegram recipient**를 수동 실행할 수 있습니다. 등록된 봇의 개인 대화방이 하나뿐일 때 그곳으로 채팅 ID와 등록 방법을 보냅니다. 채팅 ID는 공개 실행 로그에 출력하지 않습니다. 받은 숫자를 `TELEGRAM_CHAT_ID` Secret으로 등록한 뒤 **Industry report alerts**를 `send_test`와 함께 실행하세요.
+
+이 저장소의 연결 확인 워크플로는 `YBDIndepthreportcodex_bot` 계정을 확인합니다. 다른 봇을 사용하면 `.github/workflows/telegram-connect.yml`의 `EXPECTED_BOT_USERNAME`을 변경해야 합니다. 개인 대화방이 여러 개거나 `/start` 기록이 없으면 수신자를 자동 선택하지 않습니다.
+
 ## 알림 기준
 
 - 산업 리포트 중 제목이나 PDF 앞 2쪽에 `In-depth`, `심층 분석·리포트·보고서`, `산업 대해부` 표시가 있거나 PDF가 기본 **20쪽 이상**인 자료를 선별합니다.
