@@ -2,9 +2,10 @@
 
 Corporate research uses a separate company_list endpoint and is never collected.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from urllib.parse import parse_qs, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
@@ -123,9 +124,12 @@ def parse_page(html: bytes | str, *, base_url: str = LIST_URL) -> list[Report]:
     return reports
 
 
-def fetch_reports(session, *, max_pages: int = 3) -> list[Report]:
+def fetch_reports(session, *, max_pages: int = 100, lookback_days: int = 45) -> list[Report]:
     if max_pages < 1:
         raise ValueError("max_pages must be at least 1")
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be at least 1")
+    cutoff = datetime.now(ZoneInfo("Asia/Seoul")).date() - timedelta(days=lookback_days)
     reports: dict[str, Report] = {}
     for page in range(max_pages):
         response = session.get(API_URL, params={"index": page, "size": 20}, timeout=(10, 30))
@@ -133,10 +137,14 @@ def fetch_reports(session, *, max_pages: int = 3) -> list[Report]:
         page_reports, has_next = parse_api_page(response.json())
         if page == 0 and not page_reports:
             raise ValueError("NAVER industry API listing is unexpectedly empty")
+        if not page_reports and has_next:
+            raise ValueError("NAVER industry API returned an empty page with more results")
         new = [r for r in page_reports if r.source_id not in reports]
-        if not new:
-            break
+        if page_reports and not new:
+            raise ValueError("NAVER industry pagination repeated a page; scan is incomplete")
         reports.update((r.source_id, r) for r in new)
-        if not has_next:
-            break
-    return list(reports.values())
+        # Scan an overlapping publication window so late additions are found.
+        # A single backdated upload must not terminate a still-current page.
+        if not has_next or (page_reports and max(r.published_date for r in page_reports) < cutoff):
+            return list(reports.values())
+    raise ValueError("NAVER industry scan reached MAX_LIST_PAGES before the lookback boundary; increase the limit")

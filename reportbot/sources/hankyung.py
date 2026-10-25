@@ -5,8 +5,9 @@ error, so an upstream redesign cannot silently look like an empty report list.
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
@@ -85,20 +86,42 @@ def parse_reports(html: str, *, page_url: str = LIST_URL) -> list[Report]:
     return reports
 
 
-def fetch_reports(session, *, max_pages: int = 3) -> list[Report]:
+def _has_later_page(html: str, current_page: int) -> bool | None:
+    paging = BeautifulSoup(html, "html.parser").select_one("div.paging")
+    if paging is None:
+        return None
+    numbers = [int(match) for link in paging.select("a[href]")
+               for match in re.findall(r"[?&]now_page=(\d+)", link["href"])]
+    return any(number > current_page for number in numbers)
+
+
+def fetch_reports(session, *, max_pages: int = 100, lookback_days: int = 45) -> list[Report]:
     if max_pages < 1:
         raise ValueError("max_pages must be at least 1")
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be at least 1")
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    cutoff = today - timedelta(days=lookback_days)
     reports = {}
     for page in range(1, max_pages + 1):
         response = session.get(LIST_URL, params={
             "skinType": "industry", "report_type": "IN", "now_page": page,
-            "pagenum": 80,
+            "pagenum": 80, "sdate": cutoff.isoformat(), "edate": today.isoformat(),
         }, timeout=30)
         response.raise_for_status()
         response.encoding = "utf-8"
         page_reports = parse_reports(response.text, page_url=response.url)
+        if not page_reports:
+            return list(reports.values())
+        new = [report for report in page_reports if report.source_id not in reports]
+        if not new:
+            raise ValueError("Hankyung industry pagination repeated a page; scan is incomplete")
         for report in page_reports:
             reports[report.source_id] = report
-        if not page_reports:
-            break
-    return list(reports.values())
+        # The date form on the public page has a seven-day default, so always
+        # supply a wider overlap explicitly. Never use publication age to reject
+        # a newly discovered source ID; the caller decides its delivery state.
+        has_later = _has_later_page(response.text, page)
+        if has_later is False or max(report.published_date for report in page_reports) < cutoff:
+            return list(reports.values())
+    raise ValueError("Hankyung industry scan reached MAX_LIST_PAGES before its end; increase the limit")

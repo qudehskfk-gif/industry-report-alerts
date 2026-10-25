@@ -65,7 +65,7 @@ def send_samples(config: Config) -> int:
         candidates = []
         for source, fetch in SOURCES.items():
             try:
-                reports = fetch(session, max_pages=config.max_list_pages)
+                reports = fetch(session, max_pages=config.max_list_pages, lookback_days=config.scan_lookback_days)
                 candidates.extend(reports)
                 log.info("%s 후보 %d건 확인", source, len(reports))
             except Exception as exc:

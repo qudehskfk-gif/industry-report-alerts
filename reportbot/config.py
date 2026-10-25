@@ -19,6 +19,7 @@ class Config:
     max_list_pages: int
     poll_seconds: int
     max_report_age_days: int
+    scan_lookback_days: int = 45
 
     @classmethod
     def from_env(cls):
@@ -30,7 +31,8 @@ class Config:
             os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             positive_int("MIN_PDF_PAGES", 20),
-            positive_int("MAX_LIST_PAGES", 3),
-            positive_int("POLL_SECONDS", 1800),
+            positive_int("MAX_LIST_PAGES", 100),
+            positive_int("POLL_SECONDS", 86400),
             positive_int("MAX_REPORT_AGE_DAYS", 14),
+            positive_int("SCAN_LOOKBACK_DAYS", 45),
         )

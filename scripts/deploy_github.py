@@ -119,8 +119,8 @@ def deploy() -> int:
     print(f"\n생성할 공개 저장소: {repository}")
     print(f"텔레그램 수신자: {recipient} (채팅 ID: {chat_id})")
     print("프로그램을 올리고, 봇 토큰·채팅 ID를 GitHub Secrets에 등록합니다.")
-    print("연결 테스트 메시지를 보내고 30분마다 확인하는 자동화를 시작합니다.")
-    print("첫 수집은 기존 자료만 기록하며 이후 새로 발견한 자료를 알립니다.")
+    print("연결 테스트 메시지를 보내고 매일 한국시간 오후 5시에 확인하는 자동화를 시작합니다.")
+    print("조건에 맞는 미발송 자료를 PDF 원문 첨부로 보냅니다.")
     if input("이 설정을 진행하려면 yes를 입력하세요: ").strip().lower() != "yes":
         print("취소했습니다. Git 저장소나 GitHub 설정은 변경하지 않았습니다.")
         return 0

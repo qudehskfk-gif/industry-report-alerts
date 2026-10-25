@@ -36,7 +36,7 @@ def runner(monkeypatch):
     return runner
 
 
-def test_baseline_sends_nothing_and_later_only_new_report(runner, monkeypatch, config):
+def test_first_run_sends_known_unsent_reports_and_later_only_new_reports(runner, monkeypatch, config):
     old = report(source_id="old")
     new = report(title="에너지 산업의 새로운 투자 사이클")
     listing = [old]
@@ -47,26 +47,30 @@ def test_baseline_sends_nothing_and_later_only_new_report(runner, monkeypatch, c
 
     def accept(r, session, minimum):
         classifications.append(r)
-        return Decision(True, "산업 리포트 25쪽", 25, "pdf-hash")
+        return Decision(True, "산업 리포트 25쪽", 25, "pdf-hash-" + r.source_id)
 
     monkeypatch.setattr(runner, "classify", accept)
     assert runner.check(config) == 0
-    assert sent == []
-    assert classifications == []
+    assert sent == [old]
+    assert classifications == [old]
     listing.append(new)
     assert runner.check(config) == 0
-    assert sent == [new]
+    assert sent == [old, new]
     assert runner.check(config) == 0
-    assert sent == [new]
+    assert sent == [old, new]
 
 
-def test_source_failure_does_not_initialize_and_other_source_baselines(runner, monkeypatch, config):
+def test_source_failure_does_not_initialize_and_other_source_still_processes(runner, monkeypatch, config):
     def unavailable(*args, **kwargs):
         raise requests.ConnectionError("temporary failure")
 
     naver = report(source="naver")
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": unavailable, "naver": lambda *a, **k: [naver]})
+    monkeypatch.setattr(runner, "classify", lambda *a: Decision(True, "심층 표시", 25, "naver-pdf"))
+    sent = []
+    monkeypatch.setattr(Telegram, "send_report", lambda self, r, d: sent.append(r))
     assert runner.check(config) == 1
+    assert sent == [naver]
     state = State(config.state_path)
     try:
         assert not state.initialized("hankyung")
@@ -106,7 +110,9 @@ def test_pdf_failure_retries_unprocessed_report(runner, monkeypatch, config):
     assert runner.check(config) == 1
     state = State(config.state_path)
     try:
-        assert not state.seen(item)
+        assert state.outcome(item).startswith("pending")
+        assert item in state.pending()
+        assert not state.duplicate(item)
     finally:
         state.close()
     sent = []
@@ -132,7 +138,8 @@ def test_send_failure_keeps_report_pending(runner, monkeypatch, config):
     assert runner.check(config) == 1
     state = State(config.state_path)
     try:
-        assert not state.seen(item)
+        assert state.outcome(item).startswith("pending")
+        assert item in state.pending()
         assert not state.duplicate(item, "hash")
     finally:
         state.close()
@@ -155,15 +162,16 @@ def test_naver_new_item_resolves_attachment_only_when_needed(runner, monkeypatch
         return "https://example.com/industry.pdf"
 
     monkeypatch.setattr(runner.naver, "resolve_pdf_url", resolve)
-    monkeypatch.setattr(runner, "classify", lambda r, *a: Decision(r.pdf_url is not None, "PDF 25쪽", 25, "pdf"))
+    monkeypatch.setattr(runner, "classify", lambda r, *a: Decision(r.pdf_url is not None, "PDF 25쪽", 25, "pdf-" + r.source_id))
     sent = []
     monkeypatch.setattr(Telegram, "send_report", lambda self, r, d: sent.append(r))
     assert runner.check(config) == 0
-    assert resolved == []  # Baseline must not fetch old attachment details.
+    assert resolved == [item]
     newer = replace(item, source_id="46615", title="신규 산업 리포트")
     monkeypatch.setattr(runner, "SOURCES", {"naver": lambda *a, **k: [item, newer]})
     assert runner.check(config) == 0
-    assert resolved == [newer]
+    assert resolved == [item, newer]
+    assert len(sent) == 2
     assert sent[0].pdf_url == "https://example.com/industry.pdf"
 
 
@@ -238,12 +246,11 @@ def test_telegram_timeout_does_not_retry_or_expose_token(monkeypatch):
 
 
 def test_report_message_escapes_html_and_links(monkeypatch):
-    telegram = Telegram("123:test-secret", "1234")
-    messages = []
-    monkeypatch.setattr(telegram, "send", messages.append)
-    telegram.send_report(report(title="<반도체 & 배터리>", detail_url='https://example.com/?a=1&b="x"'), Decision(True, "20쪽"))
-    assert "&lt;반도체 &amp; 배터리&gt;" in messages[0]
-    assert 'a=1&amp;b=&quot;x&quot;' in messages[0]
+    from reportbot.telegram import report_caption
+
+    caption = report_caption(report(title="<반도체 & 배터리>", detail_url='https://example.com/?a=1&b="x"'), Decision(True, "20쪽"))
+    assert "&lt;반도체 &amp; 배터리&gt;" in caption
+    assert 'a=1&amp;b=&quot;x&quot;' in caption
 
 
 def test_inspect_pdf_checks_real_page_count_and_hash():

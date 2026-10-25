@@ -1,8 +1,9 @@
 """Parser contract tests and regressions from reduced real Hankyung HTML."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -46,19 +47,23 @@ def test_known_empty_listing():
     assert parse_reports("<table><tbody><tr><td>검색 결과가 없습니다</td></tr></tbody></table>") == []
 
 
-def test_fetch_requests_industry_only_and_deduplicates():
+def test_fetch_requests_industry_and_explicit_overlap_window():
     calls = []
 
     class Session:
         def get(self, url, *, params, timeout):
             calls.append((url, params, timeout))
-            return SimpleNamespace(text=SYNTHETIC_LIST, url=LIST_URL, raise_for_status=lambda: None)
+            body = SYNTHETIC_LIST if params["now_page"] == 1 else (FIXTURES / "hankyung_empty_real.html").read_text()
+            return SimpleNamespace(text=body, url=LIST_URL, raise_for_status=lambda: None)
 
     reports = fetch_reports(Session(), max_pages=2)
     assert len(reports) == 1
     assert [call[1]["now_page"] for call in calls] == [1, 2]
     assert all(call[1]["report_type"] == "IN" for call in calls)
     assert all(call[1]["skinType"] == "industry" for call in calls)
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    assert all(call[1]["sdate"] == (today - timedelta(days=45)).isoformat() for call in calls)
+    assert all(call[1]["edate"] == today.isoformat() for call in calls)
 
 
 def test_reject_wrong_category_even_if_http_success():
@@ -109,3 +114,36 @@ def test_real_last_page_stops_fetching():
 def test_invalid_pagination():
     with pytest.raises(ValueError):
         fetch_reports(None, max_pages=0)
+    with pytest.raises(ValueError):
+        fetch_reports(None, lookback_days=0)
+
+
+def test_repeated_page_is_incomplete_scan_error():
+    class Session:
+        def get(self, *args, **kwargs):
+            return SimpleNamespace(text=SYNTHETIC_LIST, url=LIST_URL, raise_for_status=lambda: None)
+
+    with pytest.raises(ValueError, match="repeated"):
+        fetch_reports(Session(), max_pages=3)
+
+
+def test_pagination_limit_is_not_silent_success():
+    class Session:
+        def get(self, *args, **kwargs):
+            return SimpleNamespace(text=SYNTHETIC_LIST, url=LIST_URL, raise_for_status=lambda: None)
+
+    with pytest.raises(ValueError, match="MAX_LIST_PAGES"):
+        fetch_reports(Session(), max_pages=1)
+
+
+def test_real_paging_last_link_stops_without_unnecessary_request():
+    html = SYNTHETIC_LIST + '<div class="paging"><span>1</span><a href="?now_page=1" class="btn last">끝</a></div>'
+    calls = []
+
+    class Session:
+        def get(self, *args, **kwargs):
+            calls.append(kwargs["params"])
+            return SimpleNamespace(text=html, url=LIST_URL, raise_for_status=lambda: None)
+
+    assert len(fetch_reports(Session(), max_pages=1)) == 1
+    assert len(calls) == 1

@@ -1,0 +1,113 @@
+name: Repair previous five as PDF attachments
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: industry-report-monitor
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      STATE_PATH: state-store/state.sqlite3
+      MIN_PDF_PAGES: '20'
+      MAX_LIST_PAGES: '100'
+      SCAN_LOOKBACK_DAYS: '45'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check Telegram secrets
+        id: credentials
+        shell: bash
+        run: |
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo '::notice::봇 연결 대기 중입니다. Repository Settings → Secrets and variables → Actions에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID를 등록하면 다음 예약 실행부터 시작합니다.'
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out application
+        if: ${{ steps.credentials.outputs.ready == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Restore notification history
+        if: ${{ steps.credentials.outputs.ready == 'true' }}
+        id: state
+        shell: bash
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin refs/heads/notification-state > "$RUNNER_TEMP/notification-state-ref"
+          ref_status=$?
+          set -e
+          case "$ref_status" in
+            0)
+              git fetch --no-tags origin refs/heads/notification-state:refs/remotes/origin/notification-state
+              git worktree add --detach state-store refs/remotes/origin/notification-state
+              git -C state-store switch -c notification-state
+              if [[ ! -f state-store/state.sqlite3 ]]; then
+                echo '::error::notification-state 브랜치에 state.sqlite3이 없습니다. 기록 손실로 인한 중복 발송을 막기 위해 실행을 중단했습니다. 이전 커밋의 파일을 복원하세요.'
+                exit 1
+              fi
+              ;;
+            2)
+              git worktree add --detach state-store HEAD
+              git -C state-store switch --orphan notification-state
+              echo '처음 실행합니다. 발송하지 않은 현재 목록을 수집해 대기열에 저장합니다.'
+              ;;
+            *)
+              echo '::error::알림 기록 브랜치를 조회하지 못했습니다. 인증·네트워크 오류를 해결한 뒤 다시 실행하세요.'
+              exit "$ref_status"
+              ;;
+          esac
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: ${{ steps.credentials.outputs.ready == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        if: ${{ steps.credentials.outputs.ready == 'true' }}
+        run: python -m pip install -r requirements.txt
+
+      - name: Resend the previous five as PDF documents and record delivery
+        if: ${{ steps.credentials.outputs.ready == 'true' }}
+        timeout-minutes: 50
+        run: python -m reportbot repair-five
+
+      - name: Save notification history
+        if: ${{ always() && steps.state.outputs.ready == 'true' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          if [[ ! -f state-store/state.sqlite3 ]]; then
+            echo '알림 기록 파일이 아직 없습니다. 초기화가 완료되지 않아 브랜치를 저장하지 않습니다.'
+            exit 0
+          fi
+          # Recover an interrupted SQLite transaction before committing the DB alone.
+          python - <<'PY'
+          import sqlite3
+          with sqlite3.connect('state-store/state.sqlite3') as database:
+              result = database.execute('PRAGMA quick_check').fetchall()
+              if result != [('ok',)]:
+                  raise RuntimeError('SQLite state integrity check failed')
+          PY
+          git -C state-store config user.name 'github-actions[bot]'
+          git -C state-store config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C state-store add state.sqlite3
+          if git -C state-store diff --cached --quiet; then
+            echo '알림 기록에 변경이 없습니다.'
+            exit 0
+          fi
+          git -C state-store commit -m 'Update industry report notification history'
+          git -C state-store push origin HEAD:refs/heads/notification-state

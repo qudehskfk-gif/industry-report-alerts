@@ -18,7 +18,8 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       MIN_PDF_PAGES: '20'
-      MAX_LIST_PAGES: '3'
+      MAX_LIST_PAGES: '100'
+      SCAN_LOOKBACK_DAYS: '45'
       PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4

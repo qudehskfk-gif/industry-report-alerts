@@ -34,11 +34,13 @@ def setup(config: Config) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="산업 심층 리포트 → 텔레그램 알림")
     commands = parser.add_subparsers(dest="command", required=True)
-    once = commands.add_parser("check", help="새 리포트 확인; 최초 실행은 기존 자료 기준선만 저장")
+    once = commands.add_parser("check", help="미발송 산업 심층 리포트 모두 PDF 첨부 발송")
     once.add_argument("--dry-run", action="store_true", help="현재 후보 분석 미리보기; 상태·발송 없음")
     commands.add_parser("telegram-setup", help="봇 확인 및 개인 chat ID 찾기")
     commands.add_parser("test-message", help="등록된 개인 채팅에 테스트 메시지 발송")
     commands.add_parser("daemon", help="이 프로세스가 켜져 있는 동안 주기적으로 확인")
+    commands.add_parser("preview", help="발송 없이 미발송 대기열과 PDF 후보 확인·저장")
+    commands.add_parser("repair-five", help="이전에 링크로 보낸 5건을 PDF 첨부로 교체하고 발송 기록 저장")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -49,7 +51,7 @@ def main() -> int:
             Telegram(config.token, config.chat_id).send("✅ 산업 심층 리포트 알림 연결 테스트입니다. 한경 컨센서스·네이버 산업 리포트를 확인합니다.")
             print("테스트 메시지를 보냈습니다.")
             return 0
-        from .runner import check
+        from .runner import check, repair_five
 
         if args.command == "check" and args.dry_run:
             return check(config, dry_run=True)
@@ -57,6 +59,10 @@ def main() -> int:
         with FileLock(str(config.state_path) + ".lock", timeout=0):
             if args.command == "check":
                 return check(config)
+            if args.command == "preview":
+                return check(config, preview_only=True)
+            if args.command == "repair-five":
+                return repair_five(config)
             while True:
                 check(config)
                 time.sleep(config.poll_seconds)
