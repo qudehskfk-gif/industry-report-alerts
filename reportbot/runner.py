@@ -105,7 +105,10 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     log.info("개별 기업 자료 제외: %s/%s | %s", report.source, report.source_id, report.title)
                 except Exception as exc:
                     if state is not None:
-                        state.record(report, "pending: retry")
+                        # Refresh attachment metadata after a failed attempt;
+                        # otherwise an expired cached URL could retry forever.
+                        retry_report = replace(report, pdf_url=None) if report.source == "naver" else report
+                        state.record(retry_report, "pending: retry")
                     log.error("%s/%s 처리 실패 (%s); 다음 일일 실행에서 재시도", report.source, report.source_id, type(exc).__name__)
                     errors += 1
             if state is not None:

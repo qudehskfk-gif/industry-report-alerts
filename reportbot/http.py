@@ -12,4 +12,7 @@ def make_session() -> requests.Session:
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     session.mount("https://", HTTPAdapter(max_retries=retries))
     session.mount("http://", HTTPAdapter(max_retries=retries))
+    # Public publisher-channel lookup is optional. A 429/Retry-After must leave
+    # that report pending until the next daily run, never stall the whole batch.
+    session.mount("https://t.me/", HTTPAdapter(max_retries=0))
     return session

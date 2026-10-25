@@ -32,7 +32,7 @@ def _normalize(text: str) -> str:
 
 def _queries(title: str) -> list[str]:
     words = re.findall(r"[\w가-힣]+", title)
-    options = [title.strip(), " ".join(words[:2]), words[0] if words else ""]
+    options = [title.strip(), " ".join(words[:2])]
     return list(dict.fromkeys(query for query in options if query))
 
 
@@ -105,7 +105,7 @@ def _expand_public_link(session, url: str) -> str | None:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or parsed.hostname not in SHORT_HOSTS:
             return None
-        response = session.head(url, timeout=(10, 20), allow_redirects=False)
+        response = session.head(url, timeout=(5, 5), allow_redirects=False)
         try:
             if response.status_code not in {301, 302, 303, 307, 308}:
                 return None
@@ -119,11 +119,11 @@ def _expand_public_link(session, url: str) -> str | None:
 
 
 def _matches_filename(session, url: str, expected: str) -> bool:
-    response = session.head(url, timeout=(10, 30), allow_redirects=True)
+    response = session.head(url, timeout=(5, 15), allow_redirects=True)
     try:
         if response.status_code in {405, 501}:
             response.close()
-            response = session.get(url, timeout=(10, 30), stream=True)
+            response = session.get(url, timeout=(5, 15), stream=True)
         response.raise_for_status()
         if _official_file_url(response.url) is None:
             return False
@@ -139,7 +139,7 @@ def resolve_attachment(session, report: Report, attach_name: str) -> str:
         raise ValueError("Shinhan attachment filename metadata is invalid")
     checked = set()
     for query in _queries(report.title):
-        response = session.get(CHANNEL_URL, params={"q": query}, timeout=(10, 30))
+        response = session.get(CHANNEL_URL, params={"q": query}, timeout=(5, 15))
         response.raise_for_status()
         for link, single_company in _published_links(response.text, report):
             try:

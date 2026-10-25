@@ -3,7 +3,7 @@ import json
 import re
 import sqlite3
 import unicodedata
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from datetime import date
 from pathlib import Path
 
@@ -114,10 +114,16 @@ class State:
         with self.db:
             for report in reports:
                 row = self.db.execute(
-                    "SELECT outcome, pdf_hash FROM reports WHERE source=? AND source_id=?",
+                    "SELECT outcome, pdf_hash, metadata_json FROM reports WHERE source=? AND source_id=?",
                     (report.source, report.source_id),
                 ).fetchone()
-                outcome, digest = row if row else ("pending", None)
+                outcome, digest, previous_raw = row if row else ("pending", None, None)
+                if previous_raw and not report.pdf_url:
+                    previous = self._decode(previous_raw)
+                    if (previous.title, previous.broker, previous.published_date) == (report.title, report.broker, report.published_date):
+                        # List APIs omit attachment URLs. Keep a verified URL so
+                        # tomorrow's ingestion does not discard today's resolution.
+                        report = replace(report, pdf_url=previous.pdf_url)
                 # An initial wider catalogue scan can discover pre-start history.
                 # Keep the already-known backlog while avoiding a historical flood.
                 if row is None and initial_id_floor is not None and report.source_id.isdigit() and int(report.source_id) <= initial_id_floor:
