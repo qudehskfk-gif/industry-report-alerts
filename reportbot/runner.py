@@ -53,6 +53,8 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     totals = {"sent": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0}
     preview_titles = set()
     preview_hashes = set()
+    report_failures = []
+    notification_errors = 0
     try:
         with make_session() as session:
             discovered, errors = discover(config, session, state)
@@ -69,10 +71,12 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     state.record(report, "duplicate")
                     totals["duplicates"] += 1
                     continue
+                failure_reason = "PDF 원문 주소를 확인하지 못했습니다."
                 try:
                     report = resolve(report, session)
                     if state is not None:
                         state.record(report, "pending")
+                    failure_reason = "PDF를 다운로드하거나 분석하지 못했습니다."
                     decision = classify(report, session, config.min_pdf_pages)
                     if not decision.accepted:
                         if state is not None:
@@ -94,6 +98,7 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         totals["ready"] += 1
                         log.info("[발송 대기 PDF] %s/%s | %s | %s | %s | %s", report.source, report.source_id, report.title, report.broker, report.published_date, decision.reason)
                     else:
+                        failure_reason = "PDF 첨부를 텔레그램으로 전송하지 못했습니다."
                         telegram.send_report(report, decision)
                         state.record(report, "sent", decision.pdf_hash)
                         totals["sent"] += 1
@@ -109,12 +114,24 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         # otherwise an expired cached URL could retry forever.
                         retry_report = replace(report, pdf_url=None) if report.source == "naver" else report
                         state.record(retry_report, "pending: retry")
-                    log.error("%s/%s 처리 실패 (%s); 다음 일일 실행에서 재시도", report.source, report.source_id, type(exc).__name__)
-                    errors += 1
+                    report_failures.append((report, failure_reason))
+                    log.warning("%s/%s 처리 보류 (%s); 원문 링크 안내 후 다음 일일 실행에서 재시도", report.source, report.source_id, type(exc).__name__)
+            if telegram is not None:
+                # Finish other PDFs first. Each unavailable report gets its own
+                # link message and remains pending, never a delivered PDF.
+                for report, reason in report_failures:
+                    try:
+                        telegram.send_report_error(report, reason)
+                        log.info("오류 자료 원문 링크 안내 성공: %s/%s | %s", report.source, report.source_id, report.title)
+                    except Exception as exc:
+                        notification_errors += 1
+                        log.error("%s/%s 오류 링크 안내 실패 (%s)", report.source, report.source_id, type(exc).__name__)
             if state is not None:
                 totals["pending"] = len(state.pending())
-            log.info("결과: %s, 오류=%d, PDF발송=%s", totals, errors, not preview)
-            return 1 if errors else 0
+            log.info("결과: %s, 수집오류=%d, 리포트오류=%d, 오류안내실패=%d, PDF발송=%s", totals, errors, len(report_failures), notification_errors, not preview)
+            # A report error handled with a delivered link is a completed run.
+            # Collection/notification failures still need operator attention.
+            return 1 if errors or notification_errors else 0
     finally:
         if state is not None:
             state.close()

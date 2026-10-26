@@ -107,7 +107,10 @@ def test_pdf_failure_retries_unprocessed_report(runner, monkeypatch, config):
         raise requests.Timeout("download temporarily unavailable")
 
     monkeypatch.setattr(runner, "classify", broken)
-    assert runner.check(config) == 1
+    notices = []
+    monkeypatch.setattr(Telegram, "send_report_error", lambda self, r, reason: notices.append(r))
+    assert runner.check(config) == 0
+    assert notices == [item]
     state = State(config.state_path)
     try:
         assert state.outcome(item).startswith("pending")
@@ -135,7 +138,10 @@ def test_send_failure_keeps_report_pending(runner, monkeypatch, config):
         raise TelegramError("temporary failure")
 
     monkeypatch.setattr(Telegram, "send_report", failure)
-    assert runner.check(config) == 1
+    notices = []
+    monkeypatch.setattr(Telegram, "send_report_error", lambda self, r, reason: notices.append(r))
+    assert runner.check(config) == 0
+    assert notices == [item]
     state = State(config.state_path)
     try:
         assert state.outcome(item).startswith("pending")

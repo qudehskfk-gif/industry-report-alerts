@@ -29,7 +29,14 @@ def config(tmp_path):
 
 
 @pytest.fixture
-def runner(monkeypatch):
+def notices(monkeypatch):
+    captured = []
+    monkeypatch.setattr(Telegram, "send_report_error", lambda self, item, reason: captured.append((item, reason)), raising=False)
+    return captured
+
+
+@pytest.fixture
+def runner(monkeypatch, notices):
     from reportbot import runner
 
     monkeypatch.setattr(runner, "make_session", lambda: nullcontext(object()))
@@ -80,7 +87,7 @@ def test_old_publication_date_does_not_exclude_a_later_registered_report(runner,
 
 
 @pytest.mark.parametrize("failure_stage", ["pdf", "upload"])
-def test_pending_failure_retries_after_source_outage_and_listing_disappearance(runner, monkeypatch, config, failure_stage):
+def test_pending_failure_retries_after_source_outage_and_listing_disappearance(runner, monkeypatch, config, failure_stage, notices):
     queued = report(source_id="100")
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [queued]})
     sent = capture_sends(monkeypatch)
@@ -93,8 +100,10 @@ def test_pending_failure_retries_after_source_outage_and_listing_disappearance(r
         monkeypatch.setattr(runner, "classify", fail)
     else:
         monkeypatch.setattr(Telegram, "send_report", fail)
-    assert runner.check(config) == 1
+    assert runner.check(config) == 0
     assert sent == []
+    assert [item for item, reason in notices] == [queued]
+    assert notices[0][1]
     state = State(config.state_path)
     try:
         assert state.pending() == [queued]
@@ -108,6 +117,7 @@ def test_pending_failure_retries_after_source_outage_and_listing_disappearance(r
     # Collection still reports the outage, while the previously saved PDF is delivered.
     assert runner.check(config) == 1
     assert sent == [queued]
+    assert len(notices) == 1
     state = State(config.state_path)
     try:
         assert state.pending() == []
@@ -152,6 +162,123 @@ def test_daily_delivery_has_no_five_report_limit(runner, monkeypatch, config):
     assert runner.check(config) == 0
     assert set(sent) == set(items)
     assert len(sent) == 8
+
+
+def test_report_error_notice_allows_success_and_keeps_retry_and_delivery_history(runner, monkeypatch, config, notices):
+    failed = report(source_id="100")
+    healthy = report(source_id="101")
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [failed, healthy]})
+    original_classify = runner.classify
+
+    def partial(item, *args):
+        if item == failed:
+            raise requests.Timeout("sensitive remote exception must not enter notice")
+        return original_classify(item, *args)
+
+    monkeypatch.setattr(runner, "classify", partial)
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config) == 0
+    assert sent == [healthy]
+    assert [item for item, reason in notices] == [failed]
+    assert "sensitive" not in notices[0][1]
+    state = State(config.state_path)
+    try:
+        assert state.outcome(failed) == "pending: retry"
+        assert state.pending() == [failed]
+        assert not state.duplicate(failed)
+        assert state.outcome(healthy) == "sent"
+        assert state.duplicate(healthy)
+    finally:
+        state.close()
+
+    monkeypatch.setattr(runner, "classify", original_classify)
+    assert runner.check(config) == 0
+    assert sent == [healthy, failed]
+    assert len(notices) == 1
+
+
+def test_no_error_notices_for_healthy_rejected_or_duplicate_reports(runner, monkeypatch, config, notices):
+    healthy = report(source_id="100")
+    periodic = report(source_id="101", title="반도체 Weekly")
+    duplicate = report(source_id="99")
+    state = State(config.state_path)
+    try:
+        state.record(duplicate, "sent", "previously-delivered-pdf")
+    finally:
+        state.close()
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [healthy, periodic, duplicate]})
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config) == 0
+    assert sent == [healthy]
+    assert notices == []
+
+
+@pytest.mark.parametrize("mode", ["dry_run", "preview_only"])
+def test_preview_errors_send_neither_pdf_nor_error_notice(runner, monkeypatch, config, notices, mode):
+    failed = report()
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [failed]})
+
+    def fail(*a, **kw):
+        raise requests.Timeout("PDF unavailable")
+
+    monkeypatch.setattr(runner, "classify", fail)
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config, **{mode: True}) == 0
+    assert sent == []
+    assert notices == []
+    if mode == "preview_only":
+        state = State(config.state_path)
+        try:
+            assert state.pending() == [failed]
+            assert not state.duplicate(failed)
+        finally:
+            state.close()
+    else:
+        assert not config.state_path.exists()
+
+
+def test_notice_delivery_failure_remains_visible_and_does_not_stop_other_notices(runner, monkeypatch, config, caplog):
+    items = [report(source_id="100"), report(source_id="101")]
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: items})
+
+    def fail_pdf(*a, **kw):
+        raise requests.Timeout("private-pdf-exception")
+
+    attempts = []
+
+    def send_notice(self, item, reason):
+        attempts.append(item)
+        if len(attempts) == 1:
+            raise TelegramError("123:private-telegram-exception")
+
+    monkeypatch.setattr(runner, "classify", fail_pdf)
+    monkeypatch.setattr(Telegram, "send_report_error", send_notice)
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config) == 1
+    assert attempts == items
+    assert sent == []
+    assert "private-pdf-exception" not in caplog.text
+    assert "private-telegram-exception" not in caplog.text
+    state = State(config.state_path)
+    try:
+        assert set(state.pending()) == set(items)
+        assert all(not state.duplicate(item) for item in items)
+    finally:
+        state.close()
+
+
+def test_every_failed_report_gets_a_separate_link_notice(runner, monkeypatch, config, notices):
+    items = [report(source_id=str(index)) for index in range(100, 107)]
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: items})
+
+    def fail(*a, **kw):
+        raise requests.Timeout("PDF unavailable")
+
+    monkeypatch.setattr(runner, "classify", fail)
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config) == 0
+    assert sent == []
+    assert [item.detail_url for item, reason in notices] == [item.detail_url for item in items]
 
 
 def test_repair_resends_exact_previous_five_then_records_them_as_delivered(runner, monkeypatch, config):

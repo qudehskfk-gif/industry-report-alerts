@@ -69,6 +69,33 @@ def report_caption(report: Report, decision: Decision) -> str:
     return caption
 
 
+def report_error_message(report: Report, reason: str) -> str:
+    """Link to the report page when a PDF could not be processed or attached.
+
+    ``reason`` is a fixed user-facing stage description, never exception text.
+    """
+    source = {"hankyung": "한경 컨센서스", "naver": "네이버 금융"}.get(report.source, report.source)
+    lines = [
+        "⚠️ <b>PDF 첨부 대신 원문 링크 안내</b>",
+        f"<b>{_escaped_trim(report.title, 600)}</b>",
+        f"{_escaped_trim(report.broker, 120)} · {report.published_date.isoformat()}",
+    ]
+    if report.sector:
+        lines.append(f"섹터: {_escaped_trim(report.sector, 100)}")
+    lines += [
+        f"출처: {_escaped_trim(source, 60)}",
+        f"확인 단계: {_escaped_trim(reason, 160)}",
+        "PDF 첨부를 완료하지 못해 원문 페이지 링크를 보냅니다.",
+        "자료는 대기 상태로 보관하고 다음 일일 실행에서 다시 시도합니다.",
+    ]
+    text = "\n".join(lines)
+    link = f'<a href="{html.escape(report.detail_url, quote=True)}">리포트 원문 페이지 열기</a>'
+    if _utf16_length(text + "\n" + link) > 4096:
+        # Do not corrupt the URL or silently omit the requested report link.
+        raise TelegramError("리포트 안내 메시지의 원문 주소가 텔레그램 길이 제한을 초과했습니다.")
+    return text + "\n" + link
+
+
 def download_pdf(url: str) -> bytes:
     """Use the same browser-compatible source client as listing/PDF inspection."""
     try:
@@ -146,6 +173,9 @@ class Telegram:
             "chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
             "link_preview_options": {"is_disabled": True},
         })
+
+    def send_report_error(self, report: Report, reason: str):
+        return self.send(report_error_message(report, reason))
 
     def send_report(self, report: Report, decision: Decision):
         if not self.chat_id:
