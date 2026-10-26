@@ -55,7 +55,7 @@ def connect_group(token: str, owner_chat_id: str, expected_username: str = "") -
         if not words:
             continue
         command = words[0].lower()
-        started = command == f"/start@{username.lower()}" and words[1:] == ["reports"]
+        started = command == f"/start@{username.lower()}" and words[1:] in ([], ["reports"])
         connected = command == f"/connect@{username.lower()}" and len(words) == 1
         if started or connected:
             groups.add(chat_id)

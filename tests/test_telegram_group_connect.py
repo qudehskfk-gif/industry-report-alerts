@@ -60,6 +60,16 @@ def test_owner_connect_command_supports_supergroup_and_bot_name_case(monkeypatch
     assert [item["chat_id"] for item in sent] == [GROUP_ID, OWNER_ID]
 
 
+def test_owner_directed_start_without_payload_connects_despite_other_members_starts(monkeypatch):
+    sent = stub_api(monkeypatch, [
+        update(owner_id=OWNER_ID + 1, group_id=GROUP_ID - 1, text=f"/start@{BOT_USERNAME}"),
+        update(owner_id=OWNER_ID + 2, text=f"/start@{BOT_USERNAME}"),
+        update(text=f"/start@{BOT_USERNAME}"),
+    ])
+    connect_telegram_group.connect_group(TOKEN, str(OWNER_ID), BOT_USERNAME)
+    assert [item["chat_id"] for item in sent] == [GROUP_ID, OWNER_ID]
+
+
 def test_unrelated_private_foreign_owner_and_service_updates_do_not_enroll(monkeypatch):
     invalid = [
         None, {}, {"message": None},
@@ -74,7 +84,7 @@ def test_unrelated_private_foreign_owner_and_service_updates_do_not_enroll(monke
     assert [item["chat_id"] for item in sent] == [GROUP_ID, OWNER_ID]
 
 
-@pytest.mark.parametrize("text", ["/start", "/connect", f"/start@{BOT_USERNAME}", f"/start@{BOT_USERNAME} other"])
+@pytest.mark.parametrize("text", ["/start", "/connect", f"/start@{BOT_USERNAME} other"])
 def test_missing_directed_enrollment_command_sends_nothing(monkeypatch, text):
     sent = stub_api(monkeypatch, [update(text=text)])
     with pytest.raises(connect_telegram_group.ConnectionSetupError):
