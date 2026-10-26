@@ -3,11 +3,13 @@
 Corporate research uses a separate company_list endpoint and is never collected.
 """
 from datetime import datetime, timedelta
+import json
 import re
 from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
+import requests
 
 from ..models import Report
 
@@ -15,6 +17,57 @@ from ..models import Report
 LIST_URL = "https://finance.naver.com/research/industry_list.naver"
 API_URL = "https://stock.naver.com/api/stockSecurity/researches/v2/industry"
 DETAIL_BASE = "https://stock.naver.com/research/industry/"
+MOBILE_DETAIL_BASE = "https://m.stock.naver.com/investment/research/industry/"
+
+
+def unwrap_pdf_url(url: str | None) -> str | None:
+    """Use the PDF inside NAVER's viewer link, rather than its HTML wrapper."""
+    if not url:
+        return None
+    if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https"):
+        raise ValueError("NAVER industry PDF has an invalid URL")
+    parsed = urlparse(url)
+    if parsed.hostname in {"m.stock.naver.com", "stock.naver.com"} and parsed.path == "/pdf":
+        targets = parse_qs(parsed.query).get("url", [])
+        if len(targets) != 1 or urlparse(targets[0]).scheme not in ("http", "https"):
+            raise ValueError("NAVER PDF viewer has an invalid target")
+        return targets[0]
+    return url
+
+
+def parse_mobile_pdf_page(html: bytes | str, report: Report) -> str:
+    """Read the public mobile page's attachment after matching report metadata."""
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script is None:
+        raise ValueError("NAVER mobile research page metadata is missing")
+    try:
+        props = json.loads(script.get_text())["props"]["pageProps"]
+        if props.get("category") != "industry" or str(props.get("researchId", "")) != report.source_id:
+            raise ValueError("NAVER mobile research page identity changed")
+        queries = props["dehydratedState"]["queries"]
+        if not isinstance(queries, list):
+            raise ValueError("NAVER mobile research queries changed")
+        candidates = set()
+        for query in queries:
+            item = query.get("state", {}).get("data", {}).get("result", {})
+            item = item.get("researchContent") if isinstance(item, dict) else None
+            if not isinstance(item, dict) or str(item.get("researchId", "")) != report.source_id:
+                continue
+            if (item.get("title", "").strip(), item.get("brokerName", "").strip(), item.get("writeDate")) != (
+                report.title.strip(), report.broker.strip(), report.published_date.isoformat(),
+            ):
+                raise ValueError("NAVER mobile attachment report metadata does not match")
+            url = unwrap_pdf_url(item.get("attachUrl"))
+            parsed = urlparse(url or "")
+            if parsed.scheme != "https" or parsed.hostname != "stock.pstatic.net" or not parsed.path.startswith("/stock-research/industry/") or not parsed.path.lower().endswith(".pdf"):
+                raise ValueError("NAVER mobile attachment is not a public industry PDF")
+            candidates.add(url)
+        if len(candidates) != 1:
+            raise ValueError("NAVER mobile attachment metadata is missing or ambiguous")
+        return candidates.pop()
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+        raise ValueError("NAVER mobile research page layout changed") from exc
 
 
 def is_placeholder_pdf_url(url: str | None) -> bool:
@@ -57,9 +110,7 @@ def parse_api_page(body) -> tuple[list[Report], bool]:
             published_date = datetime.fromisoformat(published.replace("Z", "+00:00")).date()
         except ValueError as exc:
             raise ValueError("NAVER industry API report date changed") from exc
-        pdf_url = item.get("attachUrl") or None
-        if pdf_url and (not isinstance(pdf_url, str) or urlparse(pdf_url).scheme not in ("http", "https")):
-            raise ValueError("NAVER industry PDF has an invalid URL")
+        pdf_url = unwrap_pdf_url(item.get("attachUrl"))
         # The title can hide a regular bulletin. Inspect only the opening strong
         # heading, rather than discussion of weekly/monthly data in the body.
         content = item.get("content") or ""
@@ -88,9 +139,16 @@ def resolve_pdf_url(session, report: Report) -> str | None:
         raise ValueError("NAVER industry detail report identity changed")
     if "attachUrl" not in result:
         raise ValueError("NAVER industry detail attachment metadata changed")
-    pdf_url = result["attachUrl"] or None
-    if pdf_url and (not isinstance(pdf_url, str) or urlparse(pdf_url).scheme not in ("http", "https")):
-        raise ValueError("NAVER industry PDF has an invalid URL")
+    pdf_url = unwrap_pdf_url(result["attachUrl"])
+    if not pdf_url or is_placeholder_pdf_url(pdf_url):
+        try:
+            mobile = session.get(MOBILE_DETAIL_BASE + report.source_id, timeout=(10, 30))
+            mobile.raise_for_status()
+            return parse_mobile_pdf_page(mobile.text, report)
+        except (requests.RequestException, ValueError):
+            # The public publisher channel remains a fallback if mobile NAVER
+            # cannot supply an attachment with matching identity and metadata.
+            pass
     if is_placeholder_pdf_url(pdf_url):
         from .shinhan import resolve_attachment
 
@@ -125,9 +183,7 @@ def parse_page(html: bytes | str, *, base_url: str = LIST_URL) -> list[Report]:
         date_text = ".".join(date_match.groups())
         published_date = datetime.strptime(date_text, "%Y.%m.%d" if len(date_match.group(1)) == 4 else "%y.%m.%d").date()
         pdf = row.select_one('td.file a[href], a[href*=".pdf"]')
-        pdf_url = urljoin(base_url, pdf["href"]) if pdf else None
-        if pdf_url and urlparse(pdf_url).scheme not in ("http", "https"):
-            raise ValueError("NAVER industry PDF has an invalid URL")
+        pdf_url = unwrap_pdf_url(urljoin(base_url, pdf["href"])) if pdf else None
         reports.append(Report(
             source="naver", source_id=source_id, title=title, broker=broker,
             published_date=published_date, detail_url=urljoin(base_url, href),

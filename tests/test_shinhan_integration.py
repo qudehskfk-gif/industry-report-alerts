@@ -17,6 +17,8 @@ def test_naver_popup_requires_verified_publisher_file(monkeypatch):
     placeholder = "https://www.shinhansec.com/siw/insights/research/list/view-popup.do"
 
     class Response:
+        text = ""
+
         def raise_for_status(self):
             pass
 
