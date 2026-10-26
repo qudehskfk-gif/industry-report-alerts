@@ -1,0 +1,91 @@
+name: Replay sent reports to group
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: '원래 발송한 한국 날짜 YYYY-MM-DD (비우면 오늘)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: industry-report-monitor
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      STATE_PATH: state-store/state.sqlite3
+      MIN_PDF_PAGES: '20'
+      REPLAY_DATE: ${{ inputs.report_date }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check replay configuration
+        shell: bash
+        run: |
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo '::error::텔레그램 봇과 그룹 수신처 Secret을 먼저 등록하세요.'
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Restore notification history
+        id: state
+        shell: bash
+        run: |
+          git fetch --no-tags origin refs/heads/notification-state:refs/remotes/origin/notification-state
+          git worktree add --detach state-store refs/remotes/origin/notification-state
+          git -C state-store switch -c notification-state
+          if [[ ! -f state-store/state.sqlite3 ]]; then
+            echo '::error::기존 발송 기록이 없어 재전송하지 않았습니다.'
+            exit 1
+          fi
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: python -m pip install -r requirements.txt
+
+      - name: Replay recorded PDFs to the configured group
+        timeout-minutes: 50
+        shell: bash
+        run: |
+          if [[ -n "$REPLAY_DATE" ]]; then
+            python -m reportbot.replay --date "$REPLAY_DATE"
+          else
+            python -m reportbot.replay
+          fi
+
+      - name: Save replay progress
+        if: ${{ always() && steps.state.outputs.ready == 'true' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sqlite3
+          with sqlite3.connect('state-store/state.sqlite3') as database:
+              result = database.execute('PRAGMA quick_check').fetchall()
+              if result != [('ok',)]:
+                  raise RuntimeError('SQLite state integrity check failed')
+          PY
+          git -C state-store config user.name 'github-actions[bot]'
+          git -C state-store config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C state-store add state.sqlite3
+          if git -C state-store diff --cached --quiet; then
+            echo '재전송 기록에 변경이 없습니다.'
+            exit 0
+          fi
+          git -C state-store commit -m 'Save manual report replay progress'
+          git -C state-store push origin HEAD:refs/heads/notification-state
