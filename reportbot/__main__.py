@@ -48,8 +48,9 @@ def main() -> int:
         if args.command == "telegram-setup":
             return setup(config)
         if args.command == "test-message":
-            Telegram(config.token, config.chat_id).send("✅ 산업 심층 리포트 알림 연결 테스트입니다. 한경 컨센서스·네이버 산업 리포트를 확인합니다.")
-            print("테스트 메시지를 보냈습니다.")
+            result = Telegram(config.token, config.chat_id).send("✅ 산업 심층 리포트 알림 연결 테스트입니다. 한경 컨센서스·네이버 산업 리포트를 확인합니다.")
+            destination = result.get("chat", {}).get("type") if isinstance(result, dict) else None
+            print("그룹방으로 테스트 메시지를 보냈습니다." if destination in {"group", "supergroup"} else "개인 대화방으로 테스트 메시지를 보냈습니다.")
             return 0
         from .runner import check, repair_five
 
