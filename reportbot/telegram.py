@@ -86,7 +86,7 @@ def report_error_message(report: Report, reason: str) -> str:
         f"출처: {_escaped_trim(source, 60)}",
         f"확인 단계: {_escaped_trim(reason, 160)}",
         "PDF 첨부를 완료하지 못해 원문 페이지 링크를 보냅니다.",
-        "자료는 대기 상태로 보관하고 다음 일일 실행에서 다시 시도합니다.",
+        "이 자료는 자동 재시도하지 않습니다.",
     ]
     text = "\n".join(lines)
     link = f'<a href="{html.escape(report.detail_url, quote=True)}">리포트 원문 페이지 열기</a>'
@@ -111,7 +111,7 @@ def download_pdf(url: str) -> bytes:
                     if len(data) > MAX_PDF_BYTES:
                         raise TelegramError("PDF가 첨부 검사 한도 25 MiB를 초과했습니다.")
     except (requests.RequestException, ValueError):
-        raise TelegramError("PDF 다운로드에 실패했습니다. 다음 실행에서 재시도합니다.") from None
+        raise TelegramError("PDF 다운로드에 실패했습니다.") from None
     if b"%PDF-" not in data[:1024]:
         raise TelegramError("PDF 원문이 아닌 응답을 받아 첨부하지 않았습니다.")
     return bytes(data)
@@ -155,7 +155,7 @@ class Telegram:
                 except (TypeError, ValueError):
                     raise TelegramError("텔레그램 요청 제한 응답 형식 오류") from None
                 if delay > 30:
-                    raise TelegramError("텔레그램 요청 제한. 다음 실행에서 재시도합니다.")
+                    raise TelegramError("텔레그램 요청 제한으로 전송하지 못했습니다.")
                 time.sleep(max(delay, 1))
                 continue
             if not response.ok or not body.get("ok"):
@@ -181,7 +181,7 @@ class Telegram:
         if not self.chat_id:
             raise TelegramError("TELEGRAM_CHAT_ID가 필요합니다.")
         if not report.pdf_url:
-            raise TelegramError("PDF 원문 주소가 아직 없어 첨부하지 않았습니다. 다음 실행에서 재시도합니다.")
+            raise TelegramError("PDF 원문 주소가 아직 없어 첨부하지 않았습니다.")
         data = download_pdf(report.pdf_url)
         with io.BytesIO(data) as document:
             return self.call("sendDocument", {

@@ -17,7 +17,7 @@ def report(**changes):
     return replace(item, **changes)
 
 
-def test_error_notice_contains_report_page_and_retry_information():
+def test_error_notice_contains_report_page_and_automatic_retry_stop_information():
     item = report()
     message = report_error_message(item, "PDF 원문 확인")
     assert item.title in message
@@ -28,7 +28,8 @@ def test_error_notice_contains_report_page_and_retry_information():
     assert f'href="{item.detail_url}"' in message
     assert "리포트 원문 페이지 열기" in message
     assert item.pdf_url not in message
-    assert "다음 일일 실행에서 다시 시도" in message
+    assert "이 자료는 자동 재시도하지 않습니다." in message
+    assert "다음 일일 실행에서 다시 시도" not in message
 
 
 def test_error_notice_escapes_metadata_and_preserves_clickable_url():

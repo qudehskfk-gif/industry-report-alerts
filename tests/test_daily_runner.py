@@ -86,17 +86,20 @@ def test_old_publication_date_does_not_exclude_a_later_registered_report(runner,
     assert sent == [first, late]
 
 
-@pytest.mark.parametrize("failure_stage", ["pdf", "upload"])
-def test_pending_failure_retries_after_source_outage_and_listing_disappearance(runner, monkeypatch, config, failure_stage, notices):
+@pytest.mark.parametrize("failure_stage", ["resolve", "pdf", "upload"])
+def test_first_report_failure_sends_one_link_and_never_retries_after_restart_or_rediscovery(runner, monkeypatch, config, failure_stage, notices):
     queued = report(source_id="100")
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [queued]})
     sent = capture_sends(monkeypatch)
     original_classify = runner.classify
+    original_resolve = runner.resolve
 
     def fail(*a, **kw):
         raise requests.Timeout("temporary failure")
 
-    if failure_stage == "pdf":
+    if failure_stage == "resolve":
+        monkeypatch.setattr(runner, "resolve", fail)
+    elif failure_stage == "pdf":
         monkeypatch.setattr(runner, "classify", fail)
     else:
         monkeypatch.setattr(Telegram, "send_report", fail)
@@ -106,22 +109,31 @@ def test_pending_failure_retries_after_source_outage_and_listing_disappearance(r
     assert notices[0][1]
     state = State(config.state_path)
     try:
-        assert state.pending() == [queued]
+        assert state.pending() == []
+        assert state.outcome(queued) == "error_notified"
         assert not state.duplicate(queued)
     finally:
         state.close()
 
+    monkeypatch.setattr(runner, "resolve", original_resolve)
     monkeypatch.setattr(runner, "classify", original_classify)
     monkeypatch.setattr(Telegram, "send_report", lambda self, r, d: sent.append(r))
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": fail})
-    # Collection still reports the outage, while the previously saved PDF is delivered.
     assert runner.check(config) == 1
-    assert sent == [queued]
+    assert sent == []
+    assert len(notices) == 1
+
+    # Rediscovery with a newly working URL must retain the terminal decision.
+    refreshed = replace(queued, pdf_url="https://example.com/repaired.pdf")
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [refreshed]})
+    assert runner.check(config) == 0
+    assert sent == []
     assert len(notices) == 1
     state = State(config.state_path)
     try:
         assert state.pending() == []
-        assert state.outcome(queued) == "sent"
+        assert state.outcome(queued) == "error_notified"
+        assert not state.duplicate(queued)
     finally:
         state.close()
 
@@ -164,7 +176,7 @@ def test_daily_delivery_has_no_five_report_limit(runner, monkeypatch, config):
     assert len(sent) == 8
 
 
-def test_report_error_notice_allows_success_and_keeps_retry_and_delivery_history(runner, monkeypatch, config, notices):
+def test_report_error_notice_allows_success_and_stops_retry_without_faking_pdf_delivery(runner, monkeypatch, config, notices):
     failed = report(source_id="100")
     healthy = report(source_id="101")
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [failed, healthy]})
@@ -183,8 +195,8 @@ def test_report_error_notice_allows_success_and_keeps_retry_and_delivery_history
     assert "sensitive" not in notices[0][1]
     state = State(config.state_path)
     try:
-        assert state.outcome(failed) == "pending: retry"
-        assert state.pending() == [failed]
+        assert state.outcome(failed) == "error_notified"
+        assert state.pending() == []
         assert not state.duplicate(failed)
         assert state.outcome(healthy) == "sent"
         assert state.duplicate(healthy)
@@ -193,7 +205,7 @@ def test_report_error_notice_allows_success_and_keeps_retry_and_delivery_history
 
     monkeypatch.setattr(runner, "classify", original_classify)
     assert runner.check(config) == 0
-    assert sent == [healthy, failed]
+    assert sent == [healthy]
     assert len(notices) == 1
 
 
@@ -236,6 +248,11 @@ def test_preview_errors_send_neither_pdf_nor_error_notice(runner, monkeypatch, c
     else:
         assert not config.state_path.exists()
 
+    monkeypatch.setattr(runner, "classify", lambda *a: Decision(True, "산업 리포트 25쪽", 25, "preview-pdf"))
+    assert runner.check(config) == 0
+    assert sent == [failed]
+    assert notices == []
+
 
 def test_notice_delivery_failure_remains_visible_and_does_not_stop_other_notices(runner, monkeypatch, config, caplog):
     items = [report(source_id="100"), report(source_id="101")]
@@ -261,10 +278,33 @@ def test_notice_delivery_failure_remains_visible_and_does_not_stop_other_notices
     assert "private-telegram-exception" not in caplog.text
     state = State(config.state_path)
     try:
-        assert set(state.pending()) == set(items)
+        assert state.pending() == [items[0]]
+        assert state.outcome(items[0]) == "pending: error notice"
+        assert state.outcome(items[1]) == "error_notified"
+        reason = state.get_setting("report_error_reason:hankyung:100")
+        assert reason and "private" not in reason
         assert all(not state.duplicate(item) for item in items)
     finally:
         state.close()
+
+    def forbidden_pdf(*a, **kw):
+        pytest.fail("A failed PDF must not be resolved, downloaded, or uploaded again")
+
+    monkeypatch.setattr(runner, "resolve", forbidden_pdf)
+    monkeypatch.setattr(runner, "classify", forbidden_pdf)
+    monkeypatch.setattr(Telegram, "send_report", forbidden_pdf)
+    # Only the missing link notice is retried, using its persisted safe reason.
+    assert runner.check(config) == 0
+    assert attempts == [items[0], items[1], items[0]]
+    state = State(config.state_path)
+    try:
+        assert state.pending() == []
+        assert all(state.outcome(item) == "error_notified" for item in items)
+        assert all(not state.duplicate(item) for item in items)
+    finally:
+        state.close()
+    assert runner.check(config) == 0
+    assert len(attempts) == 3
 
 
 def test_every_failed_report_gets_a_separate_link_notice(runner, monkeypatch, config, notices):

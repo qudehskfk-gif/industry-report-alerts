@@ -94,7 +94,7 @@ def test_cross_source_title_and_pdf_duplicates(tmp_path):
         state.close()
 
 
-def test_pdf_failure_retries_unprocessed_report(runner, monkeypatch, config):
+def test_pdf_failure_sends_link_and_stops_unprocessed_report(runner, monkeypatch, config):
     item = report()
     state = State(config.state_path)
     state.baseline("hankyung", [])
@@ -113,8 +113,8 @@ def test_pdf_failure_retries_unprocessed_report(runner, monkeypatch, config):
     assert notices == [item]
     state = State(config.state_path)
     try:
-        assert state.outcome(item).startswith("pending")
-        assert item in state.pending()
+        assert state.outcome(item) == "error_notified"
+        assert state.pending() == []
         assert not state.duplicate(item)
     finally:
         state.close()
@@ -122,11 +122,12 @@ def test_pdf_failure_retries_unprocessed_report(runner, monkeypatch, config):
     monkeypatch.setattr(runner, "classify", lambda *a: Decision(True, "심층 표시", 10, "hash"))
     monkeypatch.setattr(Telegram, "send_report", lambda self, r, d: sent.append(r))
     assert runner.check(config) == 0
-    assert sent == [item]
+    assert sent == []
+    assert notices == [item]
     assert attempts == [1]
 
 
-def test_send_failure_keeps_report_pending(runner, monkeypatch, config):
+def test_send_failure_sends_link_and_stops_pdf_retry(runner, monkeypatch, config):
     item = report()
     state = State(config.state_path)
     state.baseline("hankyung", [])
@@ -144,8 +145,8 @@ def test_send_failure_keeps_report_pending(runner, monkeypatch, config):
     assert notices == [item]
     state = State(config.state_path)
     try:
-        assert state.outcome(item).startswith("pending")
-        assert item in state.pending()
+        assert state.outcome(item) == "error_notified"
+        assert state.pending() == []
         assert not state.duplicate(item, "hash")
     finally:
         state.close()

@@ -50,7 +50,7 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     if not preview and not config.chat_id:
         raise ValueError("TELEGRAM_CHAT_ID를 등록하세요.")
     state = None if dry_run else State(config.state_path)
-    totals = {"sent": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0}
+    totals = {"sent": 0, "linked": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0}
     preview_titles = set()
     preview_hashes = set()
     report_failures = []
@@ -61,6 +61,12 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
             queue = discovered if state is None else state.pending()
             log.info("미발송 대기 %d건 검사 시작", len(queue))
             for report in sorted(queue, key=lambda r: (r.published_date, r.source, r.source_id)):
+                if state is not None and state.outcome(report) == "pending: error notice":
+                    # A previous PDF attempt already failed. Only an undelivered
+                    # link notice can be retried; never repeat the PDF attempt.
+                    reason = state.get_setting(f"report_error_reason:{report.source}:{report.source_id}", "PDF 첨부를 완료하지 못했습니다.")
+                    report_failures.append((report, reason))
+                    continue
                 rejection = title_rejection(report)
                 if rejection:
                     if state is not None:
@@ -110,18 +116,22 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     log.info("개별 기업 자료 제외: %s/%s | %s", report.source, report.source_id, report.title)
                 except Exception as exc:
                     if state is not None:
-                        # Refresh attachment metadata after a failed attempt;
-                        # otherwise an expired cached URL could retry forever.
-                        retry_report = replace(report, pdf_url=None) if report.source == "naver" else report
-                        state.record(retry_report, "pending: retry")
+                        if preview:
+                            # Preview never sends a notice or stops future delivery.
+                            state.record(report, "pending")
+                        else:
+                            state.set_setting(f"report_error_reason:{report.source}:{report.source_id}", failure_reason)
+                            state.record(report, "pending: error notice")
                     report_failures.append((report, failure_reason))
-                    log.warning("%s/%s 처리 보류 (%s); 원문 링크 안내 후 다음 일일 실행에서 재시도", report.source, report.source_id, type(exc).__name__)
+                    log.warning("%s/%s PDF 처리 실패 (%s); 원문 링크 안내, 자동 PDF 재시도 없음", report.source, report.source_id, type(exc).__name__)
             if telegram is not None:
                 # Finish other PDFs first. Each unavailable report gets its own
-                # link message and remains pending, never a delivered PDF.
+                # link message, then leaves the queue without a PDF-delivery key.
                 for report, reason in report_failures:
                     try:
                         telegram.send_report_error(report, reason)
+                        state.record(report, "error_notified")
+                        totals["linked"] += 1
                         log.info("오류 자료 원문 링크 안내 성공: %s/%s | %s", report.source, report.source_id, report.title)
                     except Exception as exc:
                         notification_errors += 1
