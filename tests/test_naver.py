@@ -30,6 +30,7 @@ def test_industry_row_maps_metadata_and_pdf():
     assert report.broker == "미래증권"
     assert report.published_date == date(2026, 10, 23)
     assert report.category == "industry"
+    assert report.sector == "반도체"
     assert report.pdf_url == "https://stock.pstatic.net/industry/report.pdf"
     assert report.detail_url == "https://finance.naver.com/research/industry_read.naver?nid=10&page=1"
 
@@ -80,9 +81,28 @@ def test_live_fixture():
     assert has_next
     assert reports[0].source_id == "46614"
     assert reports[0].published_date == date(2026, 10, 23)
+    assert reports[0].sector == "음식료"
+    assert next(r for r in reports if r.source_id == "46612").sector == "전기전자"
+    assert next(r for r in reports if r.source_id == "46613").sector == "기타"
     assert all(r.source == "naver" and r.category == "industry" for r in reports)
     assert next(r for r in reports if r.source_id == "46610").periodic
     assert not next(r for r in reports if r.source_id == "46612").periodic
+
+
+@pytest.mark.parametrize("sector, expected", [(" 반도체 ", "반도체"), ("기타", "기타"), (None, None), ("", None), ("   ", None), (123, None)])
+def test_api_sector_uses_site_label_when_available(sector, expected):
+    body = json.loads((FIXTURES / "naver_industry.json").read_text())
+    body["items"] = [dict(body["items"][0], industryKoreanName=sector)]
+    [report], _ = parse_api_page(body)
+    assert report.sector == expected
+
+
+def test_missing_sector_does_not_block_report():
+    body = json.loads((FIXTURES / "naver_industry.json").read_text())
+    body["items"] = [body["items"][0]]
+    body["items"][0].pop("industryKoreanName")
+    [report], _ = parse_api_page(body)
+    assert report.sector is None
 
 
 def test_lazy_detail_resolves_real_pdf_url():

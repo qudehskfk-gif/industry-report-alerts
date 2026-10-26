@@ -87,11 +87,12 @@ def test_report_uploads_pdf_bytes_as_document_with_caption(monkeypatch):
         assert kwargs["data"]["chat_id"] == CHAT_ID
         assert "42쪽" in kwargs["data"]["caption"]
         assert "PDF 원문" in kwargs["data"]["caption"]
+        assert "섹터: 반도체" in kwargs["data"]["caption"]
         assert "json" not in kwargs
         return ApiResponse()
 
     monkeypatch.setattr(telegram.session, "post", post)
-    assert telegram.send_report(report(), Decision(True, "In-depth", 42)) == {"message_id": 42}
+    assert telegram.send_report(report(source="naver", sector="반도체"), Decision(True, "In-depth", 42)) == {"message_id": 42}
     assert len(calls) == 1
     assert calls[0][0].endswith("/sendDocument")
     assert calls[0][1]["timeout"] == (10, 120)
@@ -166,6 +167,7 @@ def test_filename_and_caption_remain_safe_under_long_unicode_metadata():
     item = report(
         title="<반도체 & 배터리>😀/\\" * 300,
         broker='증권사:"<>/&' * 100,
+        sector='<반도체 & 배터리>😀' * 100,
         detail_url='https://example.com/report?a=1&b="x"',
     )
     filename = pdf_filename(item)
@@ -175,9 +177,21 @@ def test_filename_and_caption_remain_safe_under_long_unicode_metadata():
     assert not any(char in filename for char in '<>:"/\\|?*')
     assert len(caption.encode("utf-16-le")) // 2 <= 1024
     assert "&lt;반도체 &amp; 배터리&gt;" in caption
+    assert "섹터: &lt;반도체 &amp; 배터리&gt;" in caption
     assert 'a=1&amp;b=&quot;x&quot;' in caption
     assert "42쪽" in caption
     assert "PDF 보기" not in caption
+
+
+def test_caption_omits_sector_when_not_provided():
+    caption = report_caption(report(), Decision(True, "심층", 42))
+    assert "섹터:" not in caption
+
+
+def test_naver_caption_displays_miscellaneous_sector_without_guessing():
+    caption = report_caption(report(source="naver", sector="기타"), Decision(True, "심층", 42))
+    assert "섹터: 기타" in caption
+    assert "출처: 네이버 금융" in caption
 
 
 def test_long_detail_url_is_not_truncated_into_an_invalid_link():

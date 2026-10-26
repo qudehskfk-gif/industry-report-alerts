@@ -168,7 +168,7 @@ def test_persisted_metadata_contains_public_report_fields_only(tmp_path):
         data = json.loads(raw)
         assert set(data) == {
             "source", "source_id", "title", "broker", "published_date", "detail_url",
-            "pdf_url", "category", "explicit_in_depth", "periodic",
+            "pdf_url", "category", "explicit_in_depth", "periodic", "sector",
         }
         assert data["published_date"] == "2026-10-23"
         assert state.pending() == [item]

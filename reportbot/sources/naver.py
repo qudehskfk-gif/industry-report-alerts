@@ -67,10 +67,12 @@ def parse_api_page(body) -> tuple[list[Report], bool]:
         periodic = bool(heading and re.search(
             r"\b(?:weekly|daily|monthly)\b|주간|월간|일간", heading.get_text(" ", strip=True), re.I,
         ))
+        sector = item.get("industryKoreanName")
+        sector = sector.strip() or None if isinstance(sector, str) else None
         reports.append(Report(
             source="naver", source_id=source_id, title=title.strip(), broker=broker.strip(),
             published_date=published_date, detail_url=DETAIL_BASE + source_id, pdf_url=pdf_url,
-            periodic=periodic,
+            periodic=periodic, sector=sector,
         ))
     return reports, has_next
 
@@ -113,6 +115,7 @@ def parse_page(html: bytes | str, *, base_url: str = LIST_URL) -> list[Report]:
             broker = cells[title_index + 1].get_text(" ", strip=True)
         except (StopIteration, IndexError) as exc:
             raise ValueError("NAVER industry listing columns changed") from exc
+        sector = cells[title_index - 1].get_text(" ", strip=True) or None if title_index > 0 else None
         title = link.get_text(" ", strip=True)
         date_cell = row.select_one("td.date")
         date_text = date_cell.get_text(" ", strip=True) if date_cell else row.get_text(" ", strip=True)
@@ -128,7 +131,7 @@ def parse_page(html: bytes | str, *, base_url: str = LIST_URL) -> list[Report]:
         reports.append(Report(
             source="naver", source_id=source_id, title=title, broker=broker,
             published_date=published_date, detail_url=urljoin(base_url, href),
-            pdf_url=pdf_url,
+            pdf_url=pdf_url, sector=sector,
         ))
     if not reports:
         raise ValueError("NAVER industry listing is empty or its layout changed")

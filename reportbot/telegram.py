@@ -52,6 +52,10 @@ def report_caption(report: Report, decision: Decision) -> str:
         "📚 <b>산업 심층 리포트</b>",
         f"<b>{_escaped_trim(report.title, 350)}</b>",
         f"{_escaped_trim(report.broker, 90)} · {report.published_date.isoformat()}",
+    ]
+    if report.sector:
+        lines.append(f"섹터: {_escaped_trim(report.sector, 80)}")
+    lines += [
         f"출처: {_escaped_trim(source, 35)}",
         f"분량: {_escaped_trim(pages, 30)}",
         f"선정: {_escaped_trim(decision.reason, 120)}",

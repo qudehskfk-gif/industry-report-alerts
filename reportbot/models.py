@@ -14,3 +14,4 @@ class Report:
     category: str = "industry"
     explicit_in_depth: bool = False
     periodic: bool = False
+    sector: str | None = None
