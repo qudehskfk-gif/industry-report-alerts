@@ -75,7 +75,7 @@ def test_latest_actual_delivery_is_summarized_with_read_only_state(probe, monkey
 
     def summarize(report, data, pages):
         received.append((report, data, pages))
-        return [f"산업 전망 {index}" for index in range(1, 11)]
+        return [{"heading": f"핵심 주제 {index}", "points": [f"수요 변화의 근거 {index}-{point}" for point in range(1, 4)]} for index in range(1, 6)]
 
     monkeypatch.setattr(summary_test.sqlite3, "connect", read_only_connect)
     monkeypatch.setattr(summary_test, "summarize_pdf", summarize)
@@ -89,12 +89,14 @@ def test_latest_actual_delivery_is_summarized_with_read_only_state(probe, monkey
     assert payload["chat_id"] == config.chat_id
     assert payload["parse_mode"] == "HTML"
     assert "산업 분석 latest-sent" in payload["caption"]
-    assert "10. 산업 전망 10" in payload["caption"]
+    assert all(f"<b>{index}. 핵심 주제 {index}</b>" in payload["caption"] for index in range(1, 6))
+    assert len([line for line in payload["caption"].splitlines() if line.startswith("• ")]) == 15
+    assert "• 수요 변화의 근거 5-3" in payload["caption"]
     assert "(p." not in payload["caption"]
     assert attachment == pdf
     assert filename.endswith(".pdf")
     assert mime == "application/pdf"
-    assert "그룹방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다." in capsys.readouterr().out
+    assert "그룹방으로 주제별 요약과 PDF 원문을 한 메시지로 보냈습니다." in capsys.readouterr().out
     assert config.state_path.read_bytes() == original
 
 

@@ -15,14 +15,23 @@ PDF = b"%PDF-1.7\ncomplete original report bytes\n%%EOF"
 REPORT = Report("naver", "100", "반도체 산업 구조 변화", "미래증권", date(2026, 10, 26), "https://example.com/100")
 
 
-def summary_items():
-    return [{"text": f"산업 수요 전망 개선 {index}", "pages": [3, 1, 3]} for index in range(1, 11)]
+def summary_items(count=5, points=3):
+    return [{"heading": f"산업 핵심 주제 {section}", "points": [
+        {"text": f"수요 증가가 생산 확대를 견인하는 근거 {section}-{point}", "pages": [3, 1, 3]}
+        for point in range(1, points + 1)
+    ]} for section in range(1, count + 1)]
+
+
+def normalized(items=None):
+    items = summary_items() if items is None else items
+    return [{"heading": section["heading"], "points": [point["text"] for point in section["points"]]}
+            for section in items]
 
 
 def body(items=None, finish="STOP"):
     return {"candidates": [{"finishReason": finish, "content": {"parts": [
         {"thought": True, "text": "Do not display internal reasoning"},
-        {"text": json.dumps({"items": summary_items() if items is None else items}, ensure_ascii=False)},
+        {"text": json.dumps({"sections": summary_items() if items is None else items}, ensure_ascii=False)},
     ]}}]}
 
 
@@ -69,29 +78,34 @@ def provider(monkeypatch):
     return calls, responses
 
 
-def test_summary_sends_whole_pdf_and_header_key_then_validates_ten_grounded_lines(provider):
+def test_summary_sends_whole_pdf_and_header_key_with_grounded_explanatory_sections(provider):
     calls, _ = provider
-    lines = summarize.summarize_pdf(REPORT, PDF, 20)
-    assert len(lines) == 10
-    assert lines[0] == "산업 수요 전망 개선 1"
-    assert "Internal reasoning" not in "\n".join(lines)
+    sections = summarize.summarize_pdf(REPORT, PDF, 20)
+    assert sections == normalized()
+    assert len(sections) == 5 and all(len(section["points"]) == 3 for section in sections)
     [(url, options)] = calls
     assert url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
     assert API_KEY not in url
-    headers = {key.lower(): value for key, value in options["headers"].items()}
-    assert headers["x-goog-api-key"] == API_KEY
-    assert options["allow_redirects"] is False
-    assert options["timeout"] == (10, 120)
+    assert options["headers"]["x-goog-api-key"] == API_KEY
+    assert options["allow_redirects"] is False and options["timeout"] == (10, 120)
     payload = options["json"]
-    parts = payload["contents"][0]["parts"]
-    inline = next(part["inlineData"] for part in parts if "inlineData" in part)
-    assert inline["mimeType"] == "application/pdf"
-    assert base64.b64decode(inline["data"]) == PDF
-    assert payload["generationConfig"]["responseMimeType"] == "application/json"
-    assert all(len(line) <= summarize.MAX_SUMMARY_CHARS for line in lines)
-    assert all(summarize.summary_text_width(f"{index}. {line}") <= 40 for index, line in enumerate(lines, 1))
-    assert all("(p." not in line for line in lines)
+    inline = payload["contents"][0]["parts"][0]["inlineData"]
+    assert inline["mimeType"] == "application/pdf" and base64.b64decode(inline["data"]) == PDF
+    schema = payload["generationConfig"]["responseSchema"]["properties"]["sections"]
+    assert schema["items"]["properties"]["points"]["minItems"] == 3
     assert "원문 문장을 발췌" in payload["systemInstruction"]["parts"][0]["text"]
+    assert "원인·근거·의미" in payload["systemInstruction"]["parts"][0]["text"]
+    assert "Internal reasoning" not in json.dumps(sections)
+    assert "pages" not in json.dumps(sections) and "(p." not in json.dumps(sections)
+
+
+@pytest.mark.parametrize("count,points", [(3, 3), (3, 5), (5, 3)])
+def test_three_topic_fallback_and_three_to_five_support_lines_are_accepted(provider, count, points):
+    calls, responses = provider
+    items = summary_items(count, points)
+    responses[:] = [Response(data=body(items))]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized(items)
+    assert len(calls) == 1
 
 
 def test_no_key_or_off_does_not_contact_provider(provider, monkeypatch):
@@ -104,121 +118,114 @@ def test_no_key_or_off_does_not_contact_provider(provider, monkeypatch):
     assert calls == []
 
 
-def test_memory_cache_returns_copy_and_is_scoped_to_key_and_model(provider, monkeypatch):
+def test_nested_cache_returns_deep_copies_and_is_scoped_to_key_and_model(provider, monkeypatch):
     calls, responses = provider
     first = summarize.summarize_pdf(REPORT, PDF, 20)
-    first[0] = "caller mutation"
-    assert summarize.summarize_pdf(REPORT, PDF, 20)[0].startswith("산업 수요 전망")
+    first[0]["heading"] = "caller mutation"
+    first[0]["points"][0] = "nested caller mutation"
+    first[1]["points"].append("extra")
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
     assert len(calls) == 1
     monkeypatch.setenv("GEMINI_API_KEY", "different-fake-key")
     responses.append(Response())
-    assert len(summarize.summarize_pdf(REPORT, PDF, 20)) == 10
-    assert len(calls) == 2
+    assert len(summarize.summarize_pdf(REPORT, PDF, 20)) == 5
     monkeypatch.setenv("GEMINI_MODEL", "different-verified-model")
     responses.append(Response())
     summarize.summarize_pdf(REPORT, PDF, 20)
-    assert len(calls) == 3
-    assert API_KEY not in repr(summarize._CACHE)
+    assert len(calls) == 3 and API_KEY not in repr(summarize._CACHE)
 
 
-@pytest.mark.parametrize("invalid", [
-    "count", "empty", "english", "multiline", "long", "wide", "duplicate", "boolean-page",
-    "zero-page", "outside-page", "no-page", "many-pages", "string-page", "not-object",
+@pytest.mark.parametrize("invalid,code", [
+    ("count", "validation_items"), ("points-count", "validation_items"),
+    ("empty", "validation_text"), ("english", "validation_text"),
+    ("multiline", "validation_text"), ("long", "validation_text"),
+    ("wide", "validation_text"), ("heading", "validation_text"),
+    ("duplicate", "validation_duplicate"), ("duplicate-heading", "validation_duplicate"),
+    ("boolean-page", "validation_pages"), ("zero-page", "validation_pages"),
+    ("outside-page", "validation_pages"), ("no-page", "validation_pages"),
+    ("many-pages", "validation_pages"), ("string-page", "validation_pages"),
+    ("not-object", "validation_item"), ("not-section", "validation_item"),
 ])
-def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
-    _, responses = provider
-    items = deepcopy(summary_items())
-    if invalid == "count": items.pop()
-    elif invalid == "empty": items[0]["text"] = " "
-    elif invalid == "english": items[0]["text"] = "Only English sentence"
-    elif invalid == "multiline": items[0]["text"] = "산업 수요\n새로운 줄"
-    elif invalid == "long": items[0]["text"] = "가" + "A" * 24
-    elif invalid == "wide": items[0]["text"] = "가" * 19
-    elif invalid == "duplicate": items[1]["text"] = items[0]["text"]
-    elif invalid == "boolean-page": items[0]["pages"] = [True]
-    elif invalid == "zero-page": items[0]["pages"] = [0]
-    elif invalid == "outside-page": items[0]["pages"] = [21]
-    elif invalid == "no-page": items[0]["pages"] = []
-    elif invalid == "many-pages": items[0]["pages"] = [1, 2, 3, 4]
-    elif invalid == "string-page": items[0]["pages"] = ["1"]
-    elif invalid == "not-object": items[0] = "산업 수요"
-    responses[:] = [Response(data=body(items)), Response(data=body(items))]
-    with pytest.raises(summarize.SummaryError):
-        summarize.summarize_pdf(REPORT, PDF, 20)
-
-
-@pytest.mark.parametrize("text", ["가" * 18, "가" + "A" * 20, "가" + "A" * 23])
-def test_compact_summary_preserves_complete_text_at_both_limits(provider, text):
+def test_invalid_sections_are_rejected_without_cutting_their_contents(provider, invalid, code):
     calls, responses = provider
-    items = summary_items()
-    items[0]["text"] = text
-    responses[:] = [Response(data=body(items))]
-    lines = summarize.summarize_pdf(REPORT, PDF, 20)
-    assert lines[0] == text
-    assert len(lines) == 10
-    assert len(calls) == 1
-    assert all("…" not in line and "(p." not in line for line in lines)
-
-
-@pytest.mark.parametrize("text", ["가" * 19, "가" + "A" * 24, "수요\u2028개선", "성장\u200b전망", "1. 기판 수요 개선"])
-def test_compact_summary_does_not_silently_clip_long_or_hidden_line_breaks(text):
-    lines = [f"수요 개선 {index}" for index in range(10)]
-    lines[0] = text
+    items = deepcopy(summary_items())
+    point = items[0]["points"][0]
+    if invalid == "count": items.pop()
+    elif invalid == "points-count": items[0]["points"].pop()
+    elif invalid == "empty": point["text"] = " "
+    elif invalid == "english": point["text"] = "Only English sentence"
+    elif invalid == "multiline": point["text"] = "수요 증가\n생산 확대"
+    elif invalid == "long": point["text"] = "가" + "A" * 42
+    elif invalid == "wide": point["text"] = "가" * 39
+    elif invalid == "heading": items[0]["heading"] = "가" * 19
+    elif invalid == "duplicate": items[1]["points"][0]["text"] = point["text"]
+    elif invalid == "duplicate-heading": items[1]["heading"] = items[0]["heading"]
+    elif invalid == "boolean-page": point["pages"] = [True]
+    elif invalid == "zero-page": point["pages"] = [0]
+    elif invalid == "outside-page": point["pages"] = [21]
+    elif invalid == "no-page": point["pages"] = []
+    elif invalid == "many-pages": point["pages"] = [1, 2, 3, 4]
+    elif invalid == "string-page": point["pages"] = ["1"]
+    elif invalid == "not-object": items[0]["points"][0] = "수요 증가"
+    elif invalid == "not-section": items[0] = "수요 증가"
+    response = Response(data=body(items))
+    responses[:] = [response, response]
     with pytest.raises(summarize.SummaryError) as error:
-        summarize.validate_summary_lines(lines)
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == code
+    assert len(calls) == (2 if code in {"validation_text", "validation_duplicate", "validation_items"} else 1)
+
+
+def test_total_body_budget_rejects_oversized_sections_without_truncation():
+    sections = normalized(summary_items(5, 5))
+    assert all(len(point) <= summarize.MAX_POINT_CHARS for section in sections for point in section["points"])
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.validate_summary_sections(sections)
+    assert error.value.code == "validation_budget"
+
+
+@pytest.mark.parametrize("point", ["가" * 38, "가" + "A" * 41])
+def test_complete_explanation_is_kept_at_character_and_display_width_limits(point):
+    sections = normalized(summary_items(3, 3))
+    sections[0]["points"][0] = point
+    assert summarize.validate_summary_sections(sections)[0]["points"][0] == point
+
+
+@pytest.mark.parametrize("point", ["성장\u2028설명", "성장\u200b설명", "1. 수요 증가"])
+def test_hidden_line_breaks_and_pre_numbered_explanations_are_rejected(point):
+    sections = normalized(summary_items(3, 3))
+    sections[0]["points"][0] = point
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.validate_summary_sections(sections)
     assert error.value.code == "validation_text"
 
 
-def test_shared_display_width_counts_korean_and_ascii_for_mobile_lines():
-    assert summarize.summary_text_width("기판 AI 2배") == 11
-    assert summarize.summary_text_width("10. " + "가" * 18) == 40
-
-
-@pytest.mark.parametrize("problem", ["long", "duplicate", "count"])
-def test_one_ai_rewrite_can_recompress_invalid_draft_without_cutting_it(provider, problem):
+@pytest.mark.parametrize("problem", ["long", "duplicate", "count", "budget"])
+def test_one_ai_rewrite_can_fix_section_shape_or_length_semantically(provider, problem):
     calls, responses = provider
-    draft = summary_items()
-    if problem == "long":
-        draft[0]["text"] = "가" * 21
-    elif problem == "duplicate":
-        draft[1]["text"] = draft[0]["text"]
-    else:
-        draft.pop()
+    draft = summary_items(5, 5) if problem == "budget" else summary_items()
+    if problem == "long": draft[0]["points"][0]["text"] = "가" * 39
+    elif problem == "duplicate": draft[1]["heading"] = draft[0]["heading"]
+    elif problem == "count": draft.pop()
     responses[:] = [Response(data=body(draft)), Response()]
-    result = summarize.summarize_pdf(REPORT, PDF, 20)
-    assert result == [item["text"] for item in summary_items()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
     assert len(calls) == 2
     first, second = [options["json"] for _, options in calls]
-    assert len(first["contents"]) == 1
     assert second["contents"][0] == first["contents"][0]
-    assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"items": draft}
+    assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"sections": draft}
     assert "기계적으로 자르지" in second["contents"][2]["parts"][0]["text"]
-    assert "12~16자" in second["contents"][2]["parts"][0]["text"]
-    assert "maxLength" not in first["generationConfig"]["responseSchema"]["properties"]["items"]["items"]["properties"]["text"]
-    assert "12~16자" in first["generationConfig"]["responseSchema"]["properties"]["items"]["items"]["properties"]["text"]["description"]
+    assert "원인·근거·의미" in second["contents"][2]["parts"][0]["text"]
 
 
-def test_failed_ai_rewrite_stops_after_two_requests_and_caches_nothing(provider):
+def test_failed_rewrite_stops_after_two_requests_and_caches_nothing(provider):
     calls, responses = provider
     invalid = summary_items()
-    invalid[0]["text"] = "너무 긴 문장을 자동으로 잘라서 보내면 안 됩니다"
+    invalid[0]["points"][0]["text"] = "가" * 39
     responses[:] = [Response(data=body(invalid)), Response(data=body(invalid))]
     with pytest.raises(summarize.SummaryError) as error:
         summarize.summarize_pdf(REPORT, PDF, 20)
-    assert error.value.code == "validation_text"
-    assert len(calls) == 2
+    assert error.value.code == "validation_text" and len(calls) == 2
     assert not summarize._CACHE
-
-
-def test_invalid_page_evidence_never_triggers_a_rewrite(provider):
-    calls, responses = provider
-    invalid = summary_items()
-    invalid[0]["pages"] = [21]
-    responses[:] = [Response(data=body(invalid))]
-    with pytest.raises(summarize.SummaryError) as error:
-        summarize.summarize_pdf(REPORT, PDF, 20)
-    assert error.value.code == "validation_pages"
-    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("response", [Response(401), Response(503), Response(429), requests.ReadTimeout(API_KEY)])
@@ -228,6 +235,16 @@ def test_http_quota_and_transport_failures_never_trigger_ai_rewrite(provider, re
     with pytest.raises(summarize.SummaryError):
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert len(calls) == 1
+
+
+def test_invalid_page_evidence_never_triggers_a_rewrite(provider):
+    calls, responses = provider
+    invalid = summary_items()
+    invalid[0]["points"][0]["pages"] = [21]
+    responses[:] = [Response(data=body(invalid))]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_pages" and len(calls) == 1
 
 
 @pytest.mark.parametrize("response", [
@@ -241,8 +258,7 @@ def test_provider_failure_is_sanitized(provider, response, caplog):
     responses[:] = [response]
     with pytest.raises(summarize.SummaryError) as error:
         summarize.summarize_pdf(REPORT, PDF, 20)
-    assert API_KEY not in str(error.value)
-    assert API_KEY not in caplog.text
+    assert API_KEY not in str(error.value) and API_KEY not in caplog.text
 
 
 def test_rate_limit_stops_further_calls_for_same_key_in_process(provider, monkeypatch):
@@ -251,11 +267,10 @@ def test_rate_limit_stops_further_calls_for_same_key_in_process(provider, monkey
     for data in [PDF, PDF + b"\nsecond document"]:
         with pytest.raises(summarize.SummaryError):
             summarize.summarize_pdf(REPORT, data, 20)
-    assert len(calls) == 1
-    assert API_KEY not in repr(summarize._QUOTA_BLOCKED)
+    assert len(calls) == 1 and API_KEY not in repr(summarize._QUOTA_BLOCKED)
     monkeypatch.setenv("GEMINI_API_KEY", "new-fake-key")
     responses.append(Response())
-    assert len(summarize.summarize_pdf(REPORT, PDF, 20)) == 10
+    assert len(summarize.summarize_pdf(REPORT, PDF, 20)) == 5
     assert len(calls) == 2
 
 

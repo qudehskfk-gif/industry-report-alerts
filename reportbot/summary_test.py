@@ -1,4 +1,4 @@
-"""Send one delivered report as a PDF with a compact ten-line summary caption."""
+"""Send one delivered report as a PDF with a sectioned summary caption."""
 
 import io
 import logging
@@ -31,7 +31,7 @@ def send_summary_test(config: Config):
         report = resolve(report, session)
     data = download_pdf(report.pdf_url)
     pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
-    print(f"PDF 원문 확보 완료 ({pages}쪽). 10줄 요약을 요청합니다.", flush=True)
+    print(f"PDF 원문 확보 완료 ({pages}쪽). 큰 제목과 부가 설명을 갖춘 요약을 요청합니다.", flush=True)
     summary = summarize_pdf(report, data, pages)
     if summary is None:
         raise ValueError("GEMINI_API_KEY Secret을 등록해야 요약을 시험할 수 있습니다.")
@@ -43,7 +43,7 @@ def send_summary_test(config: Config):
     if not isinstance(result, dict) or not isinstance(result.get("document"), dict) or not isinstance(result.get("chat"), dict):
         raise TelegramError("요약과 PDF가 포함된 메시지의 첨부 완료 응답을 확인하지 못했습니다.")
     destination = result["chat"].get("type")
-    print("그룹방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다." if destination in {"group", "supergroup"} else "설정된 대화방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다.")
+    print("그룹방으로 주제별 요약과 PDF 원문을 한 메시지로 보냈습니다." if destination in {"group", "supergroup"} else "설정된 대화방으로 주제별 요약과 PDF 원문을 한 메시지로 보냈습니다.")
 
 
 def main() -> int:

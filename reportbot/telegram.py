@@ -10,7 +10,7 @@ import requests
 from .classify import Decision, MAX_PDF_BYTES
 from .http import make_session
 from .models import Report
-from .summarize import SummaryError, summarize_pdf, validate_summary_lines
+from .summarize import SummaryError, summarize_pdf, validate_summary_sections
 
 log = logging.getLogger(__name__)
 
@@ -100,38 +100,52 @@ def report_error_message(report: Report, reason: str) -> str:
     return text + "\n" + link
 
 
-def report_summary_caption(report: Report, decision: Decision, summary: list[str]) -> str:
-    """Put ten complete, compact lines in the PDF's single message caption."""
+def report_summary_caption(report: Report, decision: Decision, summary: list[dict]) -> str:
+    """Keep the complete sectioned summary beside the PDF in one caption."""
     try:
-        summary = validate_summary_lines(summary)
+        sections = validate_summary_sections(summary)
     except SummaryError:
-        raise TelegramError("리포트 요약은 짧고 서로 다른 열 줄이어야 합니다.") from None
+        raise TelegramError("리포트 요약은 제목 3개 또는 5개와 제목별 설명 3~5줄이어야 합니다.") from None
+    body_lines = []
+    for index, section in enumerate(sections, 1):
+        if body_lines:
+            body_lines.append("")
+        body_lines.append(f"<b>{index}. {html.escape(section['heading'], quote=False)}</b>")
+        body_lines.extend(f"• {html.escape(point, quote=False)}" for point in section["points"])
+    body = "\n".join(body_lines)
+    if _utf16_length(body) > 1024:
+        raise TelegramError("리포트 요약이 PDF 설명 길이 제한을 초과했습니다.")
+
     source = {"hankyung": "한경 컨센서스", "naver": "네이버 금융"}.get(report.source, report.source)
     pages = f"{decision.pages}쪽" if decision.pages is not None else "쪽수 미확인"
-    metadata = [_escaped_trim(source, 24)]
-    if report.sector:
-        metadata.insert(0, f"섹터: {_escaped_trim(report.sector, 40)}")
-    metadata.append(_escaped_trim(pages, 20))
-    lines = [
-        f"📚 <b>{_escaped_trim(report.title, 120)}</b>",
-        f"{_escaped_trim(report.broker, 45)} · {report.published_date.isoformat()}",
-        " · ".join(metadata),
-        "",
-        "📝 <b>AI 핵심 요약 10줄</b>",
-    ]
-    # Escape generated text as text, never truncate it into incomplete thoughts.
-    lines += [f"{index}. {html.escape(line, quote=False)}" for index, line in enumerate(summary, 1)]
-    caption = "\n".join(lines)
-    if _utf16_length(caption) > 1024:
-        raise TelegramError("리포트 요약이 PDF 설명 길이 제한을 초과했습니다.")
+
+    def metadata(title_limit, broker_limit, sector_limit, source_limit):
+        details = [_escaped_trim(source, source_limit), _escaped_trim(pages, 20)]
+        if report.sector:
+            details.insert(0, f"섹터: {_escaped_trim(report.sector, sector_limit)}")
+        return "\n".join([
+            f"📚 <b>{_escaped_trim(report.title, title_limit)}</b>",
+            f"{_escaped_trim(report.broker, broker_limit)} · {report.published_date.isoformat()}",
+            " · ".join(details),
+        ])
+
+    # Preserve every heading and explanation. Reduce optional metadata first.
+    candidates = [metadata(120, 45, 40, 24), metadata(60, 25, 22, 18),
+                  metadata(30, 16, 12, 12), f"📚 <b>{_escaped_trim(report.title, 24)}</b>", ""]
+    caption = body
+    for header in candidates:
+        candidate = header + "\n\n" + body if header else body
+        if _utf16_length(candidate) <= 1024:
+            caption = candidate
+            break
     link = f'<a href="{html.escape(report.detail_url, quote=True)}">원문 페이지</a>'
     if _utf16_length(caption + "\n" + link) <= 1024:
         caption += "\n" + link
     return caption
 
 
-def report_summary_message(report: Report, summary: list[str]) -> str:
-    """Keep the compact formatter available for callers of the old helper."""
+def report_summary_message(report: Report, summary: list[dict]) -> str:
+    """Keep the sectioned formatter available for callers of the old helper."""
     return report_summary_caption(report, Decision(True, "AI 요약"), summary)
 
 

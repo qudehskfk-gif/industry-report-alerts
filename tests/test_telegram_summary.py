@@ -21,6 +21,14 @@ def report(**changes):
     ), **changes)
 
 
+def section_summary(count=5, points=3):
+    return [
+        {"heading": f"산업 핵심 주제 {index}",
+         "points": [f"수요 변화의 원인과 의미 {index}-{point}" for point in range(1, points + 1)]}
+        for index in range(1, count + 1)
+    ]
+
+
 @pytest.fixture
 def delivery(monkeypatch):
     telegram = Telegram(TOKEN, CHAT_ID)
@@ -43,10 +51,11 @@ def delivery(monkeypatch):
     return telegram, calls, waits, downloads
 
 
-def test_summary_and_same_pdf_are_one_document_message(delivery, monkeypatch):
+@pytest.mark.parametrize("section_count,point_count", [(5, 3), (3, 5)])
+def test_sectioned_summary_and_same_pdf_are_one_document_message(delivery, monkeypatch, section_count, point_count):
     telegram, calls, waits, downloads = delivery
     item = report()
-    summary = [f"산업 전망 & 근거 {index}" for index in range(1, 11)]
+    summary = section_summary(section_count, point_count)
     received = []
 
     def summarize(source, data, pages):
@@ -59,13 +68,16 @@ def test_summary_and_same_pdf_are_one_document_message(delivery, monkeypatch):
     assert downloads == [item.pdf_url]
     assert [method for method, payload in calls] == ["sendDocument"]
     caption = calls[0][1]["caption"]
-    assert "10. 산업 전망 &amp; 근거 10" in caption
     assert "&lt;반도체 &amp; 산업&gt;" in caption
     assert "섹터: 반도체" in caption
     assert "네이버 금융" in caption and "30쪽" in caption
     assert "테스트증권 · 2026-10-26" in caption
-    assert all(f"\n{index}. " in caption for index in range(1, 11))
-    assert "(p." not in caption
+    for index in range(1, section_count + 1):
+        assert f"<b>{index}. 산업 핵심 주제 {index}</b>" in caption
+        for point in range(1, point_count + 1):
+            assert f"\n• 수요 변화의 원인과 의미 {index}-{point}" in caption
+    assert caption.count("\n• ") == section_count * point_count
+    assert "10줄" not in caption and "(p." not in caption
     assert waits == []
     assert len(caption.encode("utf-16-le")) // 2 <= 1024
 
@@ -96,26 +108,22 @@ def test_generation_failure_does_not_drop_pdf_or_expose_exception(delivery, monk
 
 def test_summary_does_not_use_a_separate_text_message(delivery, monkeypatch):
     telegram, calls, waits, downloads = delivery
-    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: [f"산업 전망 {index}" for index in range(1, 11)])
-
-    def fail_send(text):
-        pytest.fail("A report summary belongs in the document caption")
-
-    monkeypatch.setattr(telegram, "send", fail_send)
-    assert telegram.send_report(report(), DECISION) == {"message_id": 1}
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: section_summary())
+    monkeypatch.setattr(telegram, "send", lambda text: pytest.fail("Summary must stay in the PDF caption"))
+    telegram.send_report(report(), DECISION)
     assert [method for method, payload in calls] == ["sendDocument"]
-    assert "10. 산업 전망 10" in calls[0][1]["caption"]
+    assert calls[0][1]["caption"].count("\n• ") == 15
     assert waits == []
 
 
 @pytest.mark.parametrize("summary", [
-    [], ["전망"] * 9, ["전망"] * 11, ["전망"] * 9 + [" "],
-    ["전망"] * 9 + [42], ["전망"] * 9 + ["두\n줄"],
-    [f"산업 전망 {i}" for i in range(9)] + ["긴" * 21],
-    [f"산업 전망 {i}" for i in range(9)] + ["넓" * 19],
-    ["같은 요약"] * 10,
+    None, [], ["짧은 줄"] * 10, section_summary(4, 3), section_summary(3, 2),
+    section_summary(5, 6), [{"heading": "주제", "points": ["긴" * 43] * 3}] * 3,
+    [{"heading": "주제", "points": ["두\n줄", "다른 설명", "또 다른 설명"]}] * 3,
 ])
 def test_invalid_summary_is_skipped_but_pdf_is_delivered(delivery, monkeypatch, summary):
+    if summary is None:
+        summary = {"sections": section_summary()}
     telegram, calls, waits, downloads = delivery
     monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: summary)
     telegram.send_report(report(), DECISION)
@@ -123,26 +131,35 @@ def test_invalid_summary_is_skipped_but_pdf_is_delivered(delivery, monkeypatch, 
     assert "요약 생성에 실패해 PDF 원문만 첨부합니다." in calls[0][1]["caption"]
 
 
-def test_long_unicode_metadata_is_bounded_without_clipping_summary_lines():
+def test_long_metadata_is_reduced_before_complete_summary_and_html_is_escaped():
     item = report(title="<긴 제목 & 산업>😀" * 300, broker='증권사 "A"' * 100,
                   sector="<반도체>😀" * 100, detail_url="https://example.com/" + "x" * 3000)
-    summary = [f"<수요 & 공급>😀 {i}" for i in range(1, 11)]
+    summary = section_summary()
+    for index, section in enumerate(summary, 1):
+        section["heading"] = f"<수요 & 공급> {index}"
+        section["points"] = [f"<기술 & 수익> 개선의 의미 {index}-{p}" for p in range(1, 4)]
     text = report_summary_caption(item, DECISION, summary)
     assert len(text.encode("utf-16-le")) // 2 <= 1024
-    assert "&lt;수요 &amp; 공급&gt;😀" in text
-    assert all(f"\n{index}. &lt;수요 &amp; 공급&gt;😀 {index}" in text for index in range(1, 11))
+    assert "&lt;수요 &amp; 공급&gt;" in text
+    assert "&lt;기술 &amp; 수익&gt;" in text
+    assert text.count("\n• ") == 15
+    for index in range(1, 6):
+        for point in range(1, 4):
+            assert f"• &lt;기술 &amp; 수익&gt; 개선의 의미 {index}-{point}" in text
     assert "원문 페이지" not in text
 
 
-def test_caption_overflow_is_rejected_instead_of_truncating_summary():
-    summary = ["가" + "&" * 18 + chr(64 + i) for i in range(1, 11)]
+def test_caption_overflow_rejects_summary_instead_of_truncating_content():
+    summary = section_summary()
+    for index, section in enumerate(summary, 1):
+        section["points"] = ["가" + "&" * 24 + f"{index}-{p}" for p in range(1, 4)]
     with pytest.raises(TelegramError, match="PDF 설명 길이 제한"):
         report_summary_caption(report(), DECISION, summary)
 
 
 def test_caption_formatting_failure_still_sends_pdf_and_redacts_error(delivery, monkeypatch, caplog):
     telegram, calls, waits, downloads = delivery
-    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: [f"산업 전망 {i}" for i in range(1, 11)])
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: section_summary())
 
     def fail(*args):
         raise RuntimeError(f"{TOKEN} private-formatting-error")
