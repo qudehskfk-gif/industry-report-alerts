@@ -1,7 +1,9 @@
 from dataclasses import replace
 from datetime import date
+import hashlib
 import html
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,7 +73,8 @@ def test_sectioned_summary_and_same_pdf_are_one_document_message(delivery, monke
         return summary
 
     monkeypatch.setattr("reportbot.telegram.summarize_pdf", summarize)
-    assert telegram.send_report(item, DECISION) == {"message_id": 1}
+    result = telegram.send_report(item, DECISION)
+    assert result == {"message_id": 1, "_reportbot_summary_status": "complete", "_reportbot_summary_error": None}
     assert received == [(item, PDF, 30)]
     assert downloads == [item.pdf_url]
     assert [method for method, payload in calls] == ["sendDocument"]
@@ -93,7 +96,9 @@ def test_sectioned_summary_and_same_pdf_are_one_document_message(delivery, monke
 def test_disabled_summary_preserves_existing_pdf_delivery(delivery):
     telegram, calls, waits, downloads = delivery
     item = report()
-    assert telegram.send_report(item, DECISION) == {"message_id": 1}
+    assert telegram.send_report(item, DECISION) == {
+        "message_id": 1, "_reportbot_summary_status": "disabled", "_reportbot_summary_error": None,
+    }
     assert [method for method, payload in calls] == ["sendDocument"]
     assert calls[0][1]["caption"] == report_caption(item, DECISION)
     assert waits == []
@@ -106,7 +111,9 @@ def test_generation_failure_does_not_drop_pdf_or_expose_exception(delivery, monk
         raise RuntimeError(f"{TOKEN} {CHAT_ID} full-sensitive-PDF-text")
 
     monkeypatch.setattr("reportbot.telegram.summarize_pdf", fail)
-    assert telegram.send_report(report(), DECISION) == {"message_id": 1}
+    assert telegram.send_report(report(), DECISION) == {
+        "message_id": 1, "_reportbot_summary_status": "pending", "_reportbot_summary_error": "summary_error",
+    }
     assert [method for method, payload in calls] == ["sendDocument"]
     assert "요약 생성에 실패해 PDF 원문만 첨부합니다." in calls[0][1]["caption"]
     assert "RuntimeError" in caplog.text
@@ -131,7 +138,9 @@ def test_summary_failure_logs_safe_diagnostics_and_keeps_pdf(delivery, monkeypat
         )
 
     monkeypatch.setattr("reportbot.telegram.summarize_pdf", fail)
-    telegram.send_report(report(), DECISION)
+    result = telegram.send_report(report(), DECISION)
+    assert result["_reportbot_summary_status"] == "pending"
+    assert result["_reportbot_summary_error"] == code
     assert [method for method, payload in calls] == ["sendDocument"]
     assert f"code={code}; HTTP={status}; reason={reason}" in caplog.text
     for sensitive in [TOKEN, CHAT_ID, "full-sensitive-PDF-text"]:
@@ -303,3 +312,105 @@ def test_summary_failure_notice_is_omitted_when_caption_is_full(delivery, monkey
     monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: [])
     telegram.send_report(report(), DECISION)
     assert calls[0][1]["caption"] == "x" * 1024
+
+
+def test_pending_summary_receipt_is_local_and_pdf_payload_contains_no_diagnostics(delivery, monkeypatch):
+    telegram, calls, waits, downloads = delivery
+
+    def fail(*args):
+        raise SummaryError("private response", code="http_503", status_code=503)
+
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", fail)
+    result = telegram.send_report(report(), DECISION)
+    assert result["message_id"] == 1
+    assert result["_reportbot_summary_status"] == "pending"
+    assert result["_reportbot_summary_error"] == "http_503"
+    assert all(not key.startswith("_reportbot_") for key in calls[0][1])
+    assert "private response" not in str(result)
+
+
+def test_recovery_edits_original_pdf_caption_without_document_or_text_message(delivery, monkeypatch):
+    telegram, calls, waits, downloads = delivery
+    summary = section_summary()
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: summary)
+    decision = replace(DECISION, pdf_hash=hashlib.sha256(PDF).hexdigest())
+    assert telegram.update_report_summary(report(), decision, 75) == {"message_id": 1}
+    assert downloads == [report().pdf_url]
+    assert [method for method, payload in calls] == ["editMessageCaption"]
+    payload = calls[0][1]
+    assert payload["chat_id"] == CHAT_ID and payload["message_id"] == 75
+    assert payload["parse_mode"] == "HTML"
+    assert payload["caption"].count("\n• ") == 15
+    assert visible_units(payload["caption"]) <= 1024
+    assert "요약 생성에 실패" not in payload["caption"]
+
+
+@pytest.mark.parametrize("message_id", [None, 0, -1, True, "75"])
+def test_recovery_rejects_bad_receipt_before_any_download_or_api_call(delivery, monkeypatch, message_id):
+    telegram, calls, waits, downloads = delivery
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: pytest.fail("No summary request"))
+    with pytest.raises(TelegramError, match="메시지 번호"):
+        telegram.update_report_summary(report(), DECISION, message_id)
+    assert downloads == [] and calls == []
+
+
+def test_recovery_hash_mismatch_does_not_generate_or_edit(delivery, monkeypatch):
+    telegram, calls, waits, downloads = delivery
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: pytest.fail("No summary for changed PDF"))
+    with pytest.raises(TelegramError, match="일치하지"):
+        telegram.update_report_summary(report(), replace(DECISION, pdf_hash="changed-original"), 75)
+    assert downloads == [report().pdf_url] and calls == []
+
+
+@pytest.mark.parametrize("mode,expected", [("off", "config_mode"), ("auto", "config_key")])
+def test_recovery_keeps_original_message_when_summary_is_disabled(delivery, monkeypatch, mode, expected):
+    telegram, calls, waits, downloads = delivery
+    monkeypatch.setenv("SUMMARY_MODE", mode)
+    with pytest.raises(SummaryError) as error:
+        telegram.update_report_summary(report(), DECISION, 75)
+    assert error.value.code == expected
+    assert calls == []
+
+
+def test_recovery_generation_error_does_not_upload_duplicate_pdf(delivery, monkeypatch):
+    telegram, calls, waits, downloads = delivery
+
+    def fail(*args):
+        raise SummaryError("private response", code="quota_429", status_code=429)
+
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", fail)
+    with pytest.raises(SummaryError) as error:
+        telegram.update_report_summary(report(), DECISION, 75)
+    assert error.value.code == "quota_429"
+    assert calls == []
+
+
+def test_already_applied_caption_edit_is_completed_without_retry_or_leaking_description(monkeypatch, caplog):
+    telegram = Telegram(TOKEN, CHAT_ID)
+    posts = []
+    description = "Bad Request: message is not modified: " + TOKEN
+
+    def post(url, **kwargs):
+        posts.append(kwargs)
+        return SimpleNamespace(status_code=400, ok=False, json=lambda: {
+            "ok": False, "error_code": 400, "description": description,
+        })
+
+    monkeypatch.setattr(telegram.session, "post", post)
+    result = telegram.call("editMessageCaption", {"chat_id": CHAT_ID, "message_id": 75, "caption": "요약"})
+    assert result == {"message_id": 75, "_reportbot_edit_already_applied": True}
+    assert len(posts) == 1
+    assert TOKEN not in caplog.text and description not in str(result)
+
+
+@pytest.mark.parametrize("method,description", [
+    ("editMessageCaption", "Bad Request: message to edit not found"),
+    ("sendDocument", "Bad Request: message is not modified"),
+])
+def test_other_telegram_errors_are_not_treated_as_completed(monkeypatch, method, description):
+    telegram = Telegram(TOKEN, CHAT_ID)
+    monkeypatch.setattr(telegram.session, "post", lambda *args, **kwargs: SimpleNamespace(
+        status_code=400, ok=False, json=lambda: {"ok": False, "error_code": 400, "description": description},
+    ))
+    with pytest.raises(TelegramError, match="400"):
+        telegram.call(method, {"chat_id": CHAT_ID, "message_id": 75})

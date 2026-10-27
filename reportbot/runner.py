@@ -1,13 +1,15 @@
 import logging
+import os
 from dataclasses import replace
 
-from .classify import classify, title_rejection
+from .classify import Decision, classify, inspect_pdf, title_rejection
 from .config import Config
 from .http import make_session
 from .sources import hankyung, naver
 from .sources.shinhan import SingleCompanyReport
-from .state import State, title_fingerprint
-from .telegram import Telegram
+from .state import State, summary_destination_key, title_fingerprint
+from .summarize import SummaryError
+from .telegram import Telegram, TelegramError
 
 log = logging.getLogger(__name__)
 SOURCES = {"hankyung": hankyung.fetch_reports, "naver": naver.fetch_reports}
@@ -44,13 +46,68 @@ def resolve(report, session):
     return report
 
 
+def _summary_recovery_enabled() -> bool:
+    return (os.getenv("SUMMARY_MODE", "auto").strip().lower() in {"auto", "gemini"}
+            and bool(os.getenv("GEMINI_API_KEY", "").strip()))
+
+
+def _recover_summaries(config, session, state, telegram, totals):
+    """Finish Gemini summaries by editing existing PDFs, never sending them again."""
+    if not _summary_recovery_enabled():
+        return
+    destination = summary_destination_key(config.token, config.chat_id)
+    for job in state.pending_summaries(destination):
+        report = job["report"]
+        failure_code = "download_error"
+        try:
+            report = resolve(report, session)
+            pages, _, digest = inspect_pdf(session, report.pdf_url)
+            if not job["pdf_hash"] or digest != job["pdf_hash"]:
+                failure_code = "pdf_hash_mismatch"
+                raise ValueError("Previously delivered PDF could not be confirmed")
+            decision = Decision(True, f"산업 리포트 {pages}쪽", pages, digest)
+            failure_code = "summary_error"
+            telegram.update_report_summary(report, decision, job["message_id"])
+            state.complete_summary(report.source, report.source_id, destination)
+            totals["summaries_updated"] += 1
+            log.info("기존 PDF 메시지의 요약 추가 완료: %s/%s", report.source, report.source_id)
+        except Exception as exc:
+            if isinstance(exc, SummaryError):
+                failure_code = exc.code
+            elif isinstance(exc, TelegramError):
+                failure_code = "telegram_error"
+            outcome = state.defer_summary(report.source, report.source_id, destination, failure_code)
+            totals["summaries_failed" if outcome == "failed" else "summaries_deferred"] += 1
+            log.warning("기존 PDF 요약 처리 보류: %s/%s (code=%s; state=%s). PDF는 재전송하지 않습니다.",
+                        report.source, report.source_id, failure_code, outcome)
+            if isinstance(exc, SummaryError) and exc.code == "quota_429":
+                # Other queued reports remain untouched; a project-level quota
+                # error must not consume all their recovery attempts.
+                break
+
+
+def _summary_receipt(result, config):
+    if not isinstance(result, dict) or result.get("_reportbot_summary_status") != "pending":
+        return None
+    message_id = result.get("message_id")
+    if type(message_id) is not int or message_id <= 0:
+        # A successful native upload normally supplies this receipt. Do not turn
+        # an already delivered PDF into an error-link or resend it if absent.
+        log.warning("PDF 발송 응답에 요약 복구용 메시지 번호가 없어 예약하지 못했습니다.")
+        return None
+    return {"message_id": message_id,
+            "destination_key": summary_destination_key(config.token, config.chat_id),
+            "error_code": result.get("_reportbot_summary_error", "summary_error")}
+
+
 def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) -> int:
     preview = dry_run or preview_only
     telegram = None if preview else Telegram(config.token, config.chat_id)
     if not preview and not config.chat_id:
         raise ValueError("TELEGRAM_CHAT_ID를 등록하세요.")
     state = None if dry_run else State(config.state_path)
-    totals = {"sent": 0, "linked": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0}
+    totals = {"sent": 0, "linked": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0,
+              "summaries_updated": 0, "summaries_deferred": 0, "summaries_failed": 0}
     preview_titles = set()
     preview_hashes = set()
     report_failures = []
@@ -58,6 +115,10 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     try:
         with make_session() as session:
             discovered, errors = discover(config, session, state)
+            if telegram is not None:
+                # Process old jobs before recording new failed summaries, so an
+                # exhausted provider is not immediately retried in the same run.
+                _recover_summaries(config, session, state, telegram, totals)
             queue = discovered if state is None else state.pending()
             log.info("미발송 대기 %d건 검사 시작", len(queue))
             for report in sorted(queue, key=lambda r: (r.published_date, r.source, r.source_id)):
@@ -105,8 +166,13 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         log.info("[발송 대기 PDF] %s/%s | %s | %s | %s | %s", report.source, report.source_id, report.title, report.broker, report.published_date, decision.reason)
                     else:
                         failure_reason = "PDF 첨부를 텔레그램으로 전송하지 못했습니다."
-                        telegram.send_report(report, decision)
-                        state.record(report, "sent", decision.pdf_hash)
+                        delivery = telegram.send_report(report, decision)
+                        receipt = _summary_receipt(delivery, config)
+                        if receipt is None:
+                            state.record(report, "sent", decision.pdf_hash)
+                        else:
+                            state.record(report, "sent", decision.pdf_hash, summary_job=receipt)
+                            totals["summaries_deferred"] += 1
                         totals["sent"] += 1
                         log.info("PDF 발송 성공: %s/%s | %s", report.source, report.source_id, report.title)
                 except SingleCompanyReport:

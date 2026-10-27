@@ -1,7 +1,9 @@
+import hashlib
 import html
 from html.parser import HTMLParser
 import io
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -248,6 +250,16 @@ class Telegram:
                 time.sleep(max(delay, 1))
                 continue
             if not response.ok or not body.get("ok"):
+                # A previous caption edit may have succeeded before its reply
+                # was lost. Treat Telegram's exact idempotency condition as
+                # completed, without repeating the PDF upload or leaking text.
+                description = body.get("description")
+                if (method == "editMessageCaption" and response.status_code == 400
+                        and body.get("error_code") == 400 and isinstance(description, str)
+                        and (description == "Bad Request: message is not modified"
+                             or description.startswith("Bad Request: message is not modified:"))):
+                    return {"message_id": payload.get("message_id"),
+                            "_reportbot_edit_already_applied": True}
                 # Remote exception text may echo sensitive material; only expose a code.
                 code = body.get("error_code")
                 code = code if isinstance(code, int) else response.status_code
@@ -273,11 +285,19 @@ class Telegram:
             raise TelegramError("PDF 원문 주소가 아직 없어 첨부하지 않았습니다.")
         data = download_pdf(report.pdf_url)
         caption = report_caption(report, decision)
+        summary_status = "disabled"
+        summary_error = None
+        summary_stage = "generation"
         try:
             summary = summarize_pdf(report, data, decision.pages)
             if summary is not None:
+                summary_stage = "caption"
                 caption = report_summary_caption(report, decision, summary)
+                summary_status = "complete"
         except Exception as exc:
+            summary_status = "pending"
+            summary_error = (exc.code if isinstance(exc, SummaryError) else
+                             "caption_error" if summary_stage == "caption" else "summary_error")
             # A failed optional summary must never stop or permanently reject
             # the PDF; remote errors may contain credentials or source text.
             if isinstance(exc, SummaryError):
@@ -293,8 +313,35 @@ class Telegram:
             if _utf16_length(caption + "\n" + notice) <= 1024:
                 caption += "\n" + notice
         with io.BytesIO(data) as document:
-            return self.call("sendDocument", {
+            result = self.call("sendDocument", {
                 "chat_id": self.chat_id,
                 "caption": caption,
                 "parse_mode": "HTML",
             }, files={"document": (pdf_filename(report), document, "application/pdf")})
+        if not isinstance(result, dict):
+            raise TelegramError("PDF 첨부 완료 응답을 확인하지 못했습니다.")
+        # These local receipt fields are never sent to Telegram. The caller can
+        # persist a pending summary without treating PDF delivery as unfinished.
+        return {**result, "_reportbot_summary_status": summary_status,
+                "_reportbot_summary_error": summary_error}
+
+    def update_report_summary(self, report: Report, decision: Decision, message_id: int):
+        """Add Gemini's summary to the original PDF message, without resending it."""
+        if not self.chat_id:
+            raise TelegramError("TELEGRAM_CHAT_ID가 필요합니다.")
+        if type(message_id) is not int or message_id <= 0:
+            raise TelegramError("수정할 PDF 메시지 번호를 확인하세요.")
+        if not report.pdf_url:
+            raise TelegramError("PDF 원문 주소가 없어 요약을 추가하지 못했습니다.")
+        data = download_pdf(report.pdf_url)
+        if decision.pdf_hash and hashlib.sha256(data).hexdigest() != decision.pdf_hash:
+            raise TelegramError("기존 발송 PDF와 원문 파일이 일치하지 않습니다.")
+        summary = summarize_pdf(report, data, decision.pages)
+        if summary is None:
+            code = "config_mode" if os.getenv("SUMMARY_MODE", "auto").strip().lower() == "off" else "config_key"
+            raise SummaryError("요약 서비스가 비활성 상태입니다.", code=code)
+        caption = report_summary_caption(report, decision, summary)
+        return self.call("editMessageCaption", {
+            "chat_id": self.chat_id, "message_id": message_id,
+            "caption": caption, "parse_mode": "HTML",
+        })

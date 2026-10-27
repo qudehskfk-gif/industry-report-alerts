@@ -43,10 +43,11 @@ def body(items=None, finish="STOP"):
 
 
 class Response:
-    def __init__(self, status=200, data=None):
+    def __init__(self, status=200, data=None, headers=None):
         self.status_code = status
         self.data = body() if data is None else data
         self.ok = status < 400
+        self.headers = {} if headers is None else headers
 
     def json(self):
         if isinstance(self.data, Exception):
@@ -59,12 +60,20 @@ class Response:
 
 
 @pytest.fixture
-def provider(monkeypatch):
+def retry_waits(monkeypatch):
+    waits = []
+    monkeypatch.setattr(summarize.time, "sleep", waits.append)
+    return waits
+
+
+@pytest.fixture
+def provider(monkeypatch, retry_waits):
     monkeypatch.setenv("GEMINI_API_KEY", API_KEY)
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
     monkeypatch.delenv("SUMMARY_MODE", raising=False)
     summarize._CACHE.clear()
     summarize._QUOTA_BLOCKED.clear()
+    summarize._PREFERRED_MODELS.clear()
     calls, responses = [], [Response()]
 
     class Session:
@@ -300,13 +309,149 @@ def test_failed_rewrite_stops_after_two_requests_and_caches_nothing(provider):
     assert not summarize._CACHE
 
 
-@pytest.mark.parametrize("response", [Response(401), Response(503), Response(429), requests.ReadTimeout(API_KEY)])
+@pytest.mark.parametrize("response", [Response(401), Response(429), requests.ReadTimeout(API_KEY)])
 def test_http_quota_and_transport_failures_never_trigger_ai_rewrite(provider, response):
     calls, responses = provider
     responses[:] = [response]
     with pytest.raises(summarize.SummaryError):
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_explicit_transient_server_error_retries_then_keeps_valid_summary(provider, retry_waits, caplog, status):
+    calls, responses = provider
+    responses[:] = [Response(status, {"error": {"message": API_KEY}}), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 2 and retry_waits == [5]
+    assert calls[0] == calls[1]
+    assert f"HTTP={status}" in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def test_transient_server_failures_stop_at_four_generation_requests(provider, retry_waits):
+    calls, responses = provider
+    responses[:] = [Response(503)] * 5
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert (error.value.code, error.value.status_code) == ("http_503", 503)
+    assert len(calls) == 4 and retry_waits == [5, 15, 30]
+    assert len(responses) == 1 and not summarize._CACHE
+    assert [url.rsplit("/", 1)[-1] for url, _ in calls] == [
+        "gemini-3.1-flash-lite:generateContent", "gemini-3.1-flash-lite:generateContent",
+        "gemini-3.5-flash-lite:generateContent", "gemini-3.5-flash-lite:generateContent",
+    ]
+
+
+def test_two_primary_server_errors_use_verified_free_gemini_fallback(provider, retry_waits, caplog):
+    calls, responses = provider
+    responses[:] = [Response(503), Response(503), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 3 and retry_waits == [5, 15]
+    assert calls[0][0] == calls[1][0]
+    assert calls[2][0].endswith("/gemini-3.5-flash-lite:generateContent")
+    assert calls[0][1] == calls[1][1] == calls[2][1]
+    assert "모델=gemini-3.5-flash-lite" in caplog.text
+    assert API_KEY not in caplog.text
+    # A valid fallback result belongs to this fixed primary/fallback policy.
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 3
+    # Remaining reports in this same worker can use the recovered free model
+    # immediately, without repeating known-failing primary requests.
+    responses.append(Response())
+    assert summarize.summarize_pdf(REPORT, PDF + b"next report", 20) == normalized()
+    assert len(calls) == 4
+    assert calls[-1][0].endswith("/gemini-3.5-flash-lite:generateContent")
+    assert API_KEY not in repr(summarize._PREFERRED_MODELS)
+
+
+def test_failed_fallback_does_not_change_process_preference(provider):
+    _, responses = provider
+    responses[:] = [Response(503)] * 4
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert summarize._PREFERRED_MODELS == {}
+
+
+def test_recovered_model_preference_is_scoped_to_the_api_key(provider, monkeypatch):
+    calls, responses = provider
+    responses[:] = [Response(503), Response(503), Response()]
+    summarize.summarize_pdf(REPORT, PDF, 20)
+    monkeypatch.setenv("GEMINI_API_KEY", "different-fake-key")
+    responses.append(Response())
+    summarize.summarize_pdf(REPORT, PDF, 20)
+    assert calls[-1][0].endswith("/gemini-3.1-flash-lite:generateContent")
+
+
+def test_custom_primary_model_never_selects_an_implicit_fallback(provider, monkeypatch, retry_waits):
+    calls, responses = provider
+    monkeypatch.setenv("GEMINI_MODEL", "custom-model")
+    responses[:] = [Response(503), Response(503), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 3 and retry_waits == [5, 15]
+    assert all(url.endswith("/custom-model:generateContent") for url, _ in calls)
+
+
+def test_quota_error_on_fallback_blocks_later_reports_without_model_switch(provider):
+    calls, responses = provider
+    responses[:] = [Response(503), Response(503), Response(429)]
+    for data in [PDF, PDF + b"second report"]:
+        with pytest.raises(summarize.SummaryError) as error:
+            summarize.summarize_pdf(REPORT, data, 20)
+        assert error.value.code == "quota_429"
+    assert len(calls) == 3
+
+
+def test_transient_retry_and_semantic_rewrite_share_four_request_budget(provider, retry_waits):
+    calls, responses = provider
+    invalid = summary_items()
+    invalid.pop()
+    responses[:] = [Response(503), Response(data=body(invalid)), Response(502), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 4 and retry_waits == [5, 15]
+    payloads = [options["json"] for _, options in calls]
+    assert len(payloads[0]["contents"]) == len(payloads[1]["contents"]) == 1
+    assert len(payloads[2]["contents"]) == len(payloads[3]["contents"]) == 3
+    assert calls[3][0].endswith("/gemini-3.5-flash-lite:generateContent")
+
+
+def test_last_request_cannot_open_an_extra_semantic_rewrite(provider, retry_waits):
+    calls, responses = provider
+    invalid = summary_items()
+    invalid.pop()
+    responses[:] = [Response(503)] * 3 + [Response(data=body(invalid)), Response()]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_items"
+    assert len(calls) == 4 and retry_waits == [5, 15, 30]
+    assert len(responses) == 1 and not summarize._CACHE
+
+
+@pytest.mark.parametrize("header,expected_waits,request_count", [
+    ("22", [22], 2), ("0", [5], 2), ("invalid", [5], 2), ("90", [], 1),
+])
+def test_retry_after_is_honored_without_unbounded_sleep(provider, retry_waits, header, expected_waits, request_count):
+    calls, responses = provider
+    responses[:] = [Response(503, headers={"Retry-After": header}), Response()]
+    if request_count == 1:
+        with pytest.raises(summarize.SummaryError) as error:
+            summarize.summarize_pdf(REPORT, PDF, 20)
+        assert error.value.code == "http_503"
+    else:
+        assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == request_count and retry_waits == expected_waits
+
+
+@pytest.mark.parametrize("code,status,expected", [
+    ("http_503", 503, True), ("http_502", 502, True),
+    ("quota_429", 429, True), ("transport_error", None, True),
+    ("http_400", 400, False), ("config_key", None, False),
+    ("validation_pages", None, False), ("validation_budget", None, False),
+])
+def test_later_worker_retry_classification_uses_only_summary_error_fields(code, status, expected):
+    error = summarize.SummaryError("private response", code=code, status_code=status)
+    assert summarize.is_retryable_summary_error(error) is expected
+    assert summarize.is_retryable_summary_error(RuntimeError(code)) is False
 
 
 def test_invalid_page_evidence_never_triggers_a_rewrite(provider):
@@ -327,7 +472,7 @@ def test_invalid_page_evidence_never_triggers_a_rewrite(provider):
 ])
 def test_provider_failure_is_sanitized(provider, response, caplog):
     _, responses = provider
-    responses[:] = [response]
+    responses[:] = [response] * (4 if getattr(response, "status_code", None) in {500, 502, 503, 504} else 1)
     with pytest.raises(summarize.SummaryError) as error:
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert API_KEY not in str(error.value) and API_KEY not in caplog.text

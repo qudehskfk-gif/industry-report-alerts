@@ -1,13 +1,60 @@
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
 import unicodedata
 from dataclasses import asdict, fields, replace
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Report
+
+
+_SUMMARY_ERROR_CODES = frozenset({
+    "summary_error", "http_error", "quota_429", "transport_error",
+    "response_json", "response_schema", "response_incomplete",
+    "config_mode", "config_model", "config_key", "model_not_supported",
+    "validation_pdf", "validation_page_count", "validation_items",
+    "validation_item", "validation_text", "validation_duplicate",
+    "validation_pages", "validation_budget", "caption_error", "telegram_error",
+    "download_error", "pdf_hash_mismatch", "summary_disabled",
+})
+
+
+def summary_destination_key(token: str, chat_id: str) -> str:
+    """Identify the configured recipient without storing its ID or bot token."""
+    if not isinstance(token, str) or not token or not isinstance(chat_id, str) or not chat_id:
+        raise ValueError("A bot credential and recipient are required")
+    return hmac.new(token.encode(), chat_id.encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def _destination_key(value) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{24}", value) is None:
+        raise ValueError("Invalid summary recipient key")
+    return value
+
+
+def _summary_error_code(value) -> str:
+    if isinstance(value, str) and (value in _SUMMARY_ERROR_CODES or re.fullmatch(r"http_[1-5][0-9]{2}", value)):
+        return value
+    return "summary_error"
+
+
+def _utc_now(now=None) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc).replace(microsecond=0)
+    if isinstance(now, str):
+        now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    if not isinstance(now, datetime):
+        raise ValueError("Invalid summary retry time")
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _utc_text(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def title_fingerprint(report: Report) -> str:
@@ -38,6 +85,21 @@ class State:
             CREATE TABLE IF NOT EXISTS state_meta (
                 name TEXT PRIMARY KEY, value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS summary_jobs (
+                source TEXT NOT NULL, source_id TEXT NOT NULL,
+                destination_key TEXT NOT NULL,
+                message_id INTEGER NOT NULL CHECK(message_id > 0),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(state IN ('pending','completed','failed')),
+                next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error_code TEXT NOT NULL DEFAULT 'summary_error',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(source,source_id,destination_key)
+            );
+            CREATE INDEX IF NOT EXISTS summary_jobs_due
+                ON summary_jobs(destination_key,state,next_attempt_at);
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(reports)")}
         with self.db:
@@ -165,7 +227,17 @@ class State:
             keys.append(("pdf", pdf_hash))
         return any(self.db.execute("SELECT 1 FROM delivered WHERE kind=? AND fingerprint=?", key).fetchone() for key in keys)
 
-    def record(self, report: Report, outcome: str, pdf_hash: str | None = None):
+    def record(self, report: Report, outcome: str, pdf_hash: str | None = None,
+               *, summary_job: dict | None = None):
+        receipt = None
+        if summary_job is not None:
+            if outcome != "sent" or not isinstance(summary_job, dict):
+                raise ValueError("Summary retries require a successful PDF delivery")
+            message_id = summary_job.get("message_id")
+            if type(message_id) is not int or message_id <= 0:
+                raise ValueError("Invalid delivered-message receipt")
+            receipt = (message_id, _destination_key(summary_job.get("destination_key")),
+                       _summary_error_code(summary_job.get("error_code")))
         with self.db:
             self.db.execute("""
                 INSERT INTO reports(source,source_id,title,outcome,metadata_json,pdf_hash)
@@ -178,3 +250,68 @@ class State:
             """, (report.source, report.source_id, report.title, outcome, self._encode(report), pdf_hash))
             if outcome == "sent":
                 self._delivered(report, pdf_hash)
+            if receipt is not None:
+                message_id, destination_key, error_code = receipt
+                # Delivery and recovery receipt commit together. Reingestion or
+                # repeated bookkeeping must never reopen a completed/failed job.
+                self.db.execute("""
+                    INSERT INTO summary_jobs(
+                        source,source_id,destination_key,message_id,last_error_code
+                    ) VALUES (?,?,?,?,?)
+                    ON CONFLICT(source,source_id,destination_key) DO NOTHING
+                """, (report.source, report.source_id, destination_key, message_id, error_code))
+
+    def pending_summaries(self, destination_key: str, *, now=None) -> list[dict]:
+        """Read due caption-repair jobs for the currently configured recipient."""
+        destination_key = _destination_key(destination_key)
+        rows = self.db.execute("""
+            SELECT j.source,j.source_id,j.destination_key,j.message_id,j.attempts,
+                   r.metadata_json,r.pdf_hash,j.last_error_code,j.next_attempt_at
+            FROM summary_jobs AS j
+            JOIN reports AS r ON r.source=j.source AND r.source_id=j.source_id
+            WHERE j.destination_key=? AND j.state='pending'
+                AND j.next_attempt_at<=? AND r.outcome='sent'
+                AND r.metadata_json IS NOT NULL
+            ORDER BY j.next_attempt_at,j.created_at,j.source,j.source_id
+        """, (destination_key, _utc_text(_utc_now(now)))).fetchall()
+        return [{"source": row[0], "source_id": row[1], "destination_key": row[2],
+                 "message_id": row[3], "attempts": row[4],
+                 "report": self._decode(row[5]), "pdf_hash": row[6],
+                 "error_code": row[7], "next_attempt_at": row[8]}
+                for row in rows]
+
+    def complete_summary(self, source: str, source_id: str, destination_key: str) -> bool:
+        """Complete recovery without touching PDF delivery or deduplication."""
+        destination_key = _destination_key(destination_key)
+        with self.db:
+            result = self.db.execute("""
+                UPDATE summary_jobs SET state='completed',updated_at=CURRENT_TIMESTAMP
+                WHERE source=? AND source_id=? AND destination_key=? AND state='pending'
+            """, (source, source_id, destination_key))
+        return result.rowcount == 1
+
+    def defer_summary(self, source: str, source_id: str, destination_key: str,
+                      error_code, *, max_attempts: int = 3,
+                      retry_delay_seconds: int = 3600, now=None) -> str | None:
+        """Persist bounded retries; exhausted jobs never become pending again."""
+        destination_key = _destination_key(destination_key)
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("Summary retry attempts must be positive")
+        if type(retry_delay_seconds) is not int or retry_delay_seconds < 0:
+            raise ValueError("Summary retry delay must be nonnegative")
+        instant = _utc_now(now)
+        next_attempt = _utc_text(instant + timedelta(seconds=retry_delay_seconds))
+        with self.db:
+            self.db.execute("""
+                UPDATE summary_jobs
+                SET attempts=attempts+1,
+                    state=CASE WHEN attempts+1>=? THEN 'failed' ELSE 'pending' END,
+                    next_attempt_at=?,last_error_code=?,updated_at=?
+                WHERE source=? AND source_id=? AND destination_key=? AND state='pending'
+            """, (max_attempts, next_attempt, _summary_error_code(error_code),
+                  _utc_text(instant), source, source_id, destination_key))
+            row = self.db.execute("""
+                SELECT state FROM summary_jobs
+                WHERE source=? AND source_id=? AND destination_key=?
+            """, (source, source_id, destination_key)).fetchone()
+        return row[0] if row else None

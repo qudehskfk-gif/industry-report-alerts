@@ -92,7 +92,9 @@ def test_report_uploads_pdf_bytes_as_document_with_caption(monkeypatch):
         return ApiResponse()
 
     monkeypatch.setattr(telegram.session, "post", post)
-    assert telegram.send_report(report(source="naver", sector="반도체"), Decision(True, "In-depth", 42)) == {"message_id": 42}
+    result = telegram.send_report(report(source="naver", sector="반도체"), Decision(True, "In-depth", 42))
+    assert result["message_id"] == 42
+    assert result["_reportbot_summary_status"] == "disabled"
     assert len(calls) == 1
     assert calls[0][0].endswith("/sendDocument")
     assert calls[0][1]["timeout"] == (10, 120)

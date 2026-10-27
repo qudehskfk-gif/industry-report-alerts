@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 
 import requests
@@ -79,6 +80,32 @@ def _http_error(response) -> SummaryError:
                         status_code=response.status_code, reason=_error_reason(response))
 
 
+_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+MAX_GENERATION_REQUESTS = 4
+_TRANSIENT_RETRY_DELAYS = (5, 15, 30)
+
+
+def is_retryable_summary_error(error: Exception) -> bool:
+    """Whether a later worker execution may recover without operator changes."""
+    return isinstance(error, SummaryError) and (
+        error.status_code in _RETRYABLE_HTTP_STATUSES
+        or error.code in {"quota_429", "transport_error"}
+    )
+
+
+def _transient_retry_delay(response, retries: int) -> int | None:
+    delay = _TRANSIENT_RETRY_DELAYS[min(retries, len(_TRANSIENT_RETRY_DELAYS) - 1)]
+    # Do not turn an upstream Retry-After into an unbounded worker sleep.
+    headers = getattr(response, "headers", {})
+    try:
+        retry_after = int(headers.get("Retry-After", ""))
+    except (TypeError, ValueError, AttributeError):
+        return delay
+    if retry_after > 30:
+        return None
+    return max(delay, max(retry_after, 0))
+
+
 def check_provider_connection() -> None:
     """Check credentials and model availability without generating content."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -112,6 +139,9 @@ def check_provider_connection() -> None:
 
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
+# Both fixed models support native PDFs and structured output on the free tier.
+# Never select a different provider or an unverified paid model automatically.
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 MAX_SUMMARY_CHARS = 24
 MAX_SUMMARY_WIDTH = 36
 SECTION_COUNTS = frozenset({3, 5})
@@ -123,6 +153,9 @@ MAX_SUMMARY_TEXT_UNITS = 1024
 log = logging.getLogger(__name__)
 _CACHE: OrderedDict[tuple, list[dict]] = OrderedDict()
 _QUOTA_BLOCKED: set[str] = set()
+# A recovered fallback is preferred only for the remaining lifetime of this
+# worker process. Do not repeatedly hit an unavailable primary for every PDF.
+_PREFERRED_MODELS: dict[tuple[str, str], str] = {}
 
 SYSTEM_PROMPT = """당신은 한국어 산업 리서치 보고서 요약자입니다.
 첨부된 PDF 전체의 본문·표·차트를 읽고, 산업의 핵심 논지를 자신의 말로 재구성하세요.
@@ -357,14 +390,36 @@ def summarize_pdf(report: Report, pdf_bytes: bytes, page_count: int | None) -> l
     }
     try:
         with requests.Session() as session:
-            for attempt in range(2):
+            rewritten = False
+            transient_retries = 0
+            active_model = _PREFERRED_MODELS.get((key_id, model), model)
+            primary_server_failures = 0
+            for attempt in range(MAX_GENERATION_REQUESTS):
                 response = session.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{active_model}:generateContent",
                     headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                     json=payload, timeout=(10, 120), allow_redirects=False,
                 )
                 if response.status_code == 429:
                     _QUOTA_BLOCKED.add(key_id)
+                if response.status_code in _RETRYABLE_HTTP_STATUSES:
+                    if active_model == model:
+                        primary_server_failures += 1
+                    delay = _transient_retry_delay(response, transient_retries)
+                    if attempt + 1 < MAX_GENERATION_REQUESTS and delay is not None:
+                        if model == DEFAULT_MODEL and active_model == model and primary_server_failures >= 2:
+                            active_model = DEFAULT_FALLBACK_MODEL
+                            log.warning(
+                                "Gemini 대체 모델 사용 (이전=%s; 모델=%s; HTTP=%s).",
+                                model, active_model, response.status_code,
+                            )
+                        log.warning(
+                            "Gemini 일시 오류 재시도 (HTTP=%s; 생성 횟수=%s/%s; 대기=%s초; 모델=%s).",
+                            response.status_code, attempt + 1, MAX_GENERATION_REQUESTS, delay, active_model,
+                        )
+                        transient_retries += 1
+                        time.sleep(delay)
+                        continue
                 if response.status_code != 200:
                     raise _http_error(response)
                 try:
@@ -376,7 +431,7 @@ def summarize_pdf(report: Report, pdf_bytes: bytes, page_count: int | None) -> l
                     lines = _validated_sections(draft, page_count)
                 except SummaryError as error:
                     units = _draft_summary_units(draft)
-                    if attempt != 0 or error.code not in {"validation_text", "validation_duplicate", "validation_items", "validation_budget"}:
+                    if rewritten or attempt + 1 >= MAX_GENERATION_REQUESTS or error.code not in {"validation_text", "validation_duplicate", "validation_items", "validation_budget"}:
                         log.warning("요약 검증 실패 (code=%s; 표시 길이=%s; 상한=%s; 생성 횟수=%s).",
                                     error.code, units, MAX_SUMMARY_TEXT_UNITS, attempt + 1)
                         raise
@@ -391,7 +446,9 @@ def summarize_pdf(report: Report, pdf_bytes: bytes, page_count: int | None) -> l
                             "전체 표시 길이를 900 단위 안팎으로 다시 작성하세요."
                         )
                     # A single semantic rewrite may fix content constraints.
+                    # It shares the same bounded request budget as 5xx retries.
                     # Never repeat uncertain HTTP calls or silently cut text.
+                    rewritten = True
                     payload = {**payload, "contents": [
                         *payload["contents"],
                         {"role": "model", "parts": [{"text": json.dumps(draft, ensure_ascii=False)}]},
@@ -402,6 +459,8 @@ def summarize_pdf(report: Report, pdf_bytes: bytes, page_count: int | None) -> l
     except requests.RequestException as error:
         raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.",
                            code="transport_error", reason=_transport_reason(error)) from None
+    if model == DEFAULT_MODEL and active_model == DEFAULT_FALLBACK_MODEL:
+        _PREFERRED_MODELS[(key_id, model)] = active_model
     _CACHE[cache_key] = deepcopy(lines)
     _CACHE.move_to_end(cache_key)
     while len(_CACHE) > 128:
