@@ -11,7 +11,7 @@ from .config import Config
 from .http import make_session
 from .runner import resolve
 from .state import State
-from .summarize import SummaryError, summarize_pdf
+from .summarize import SummaryError, check_provider_connection, summarize_pdf
 from .telegram import Telegram, download_pdf, report_summary_message
 
 
@@ -30,6 +30,7 @@ def send_summary_test(config: Config):
         report = resolve(report, session)
     data = download_pdf(report.pdf_url)
     pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
+    print(f"PDF 원문 확보 완료 ({pages}쪽). 10줄 요약을 요청합니다.", flush=True)
     summary = summarize_pdf(report, data, pages)
     if summary is None:
         raise ValueError("GEMINI_API_KEY Secret을 등록해야 요약을 시험할 수 있습니다.")
@@ -41,7 +42,11 @@ def send_summary_test(config: Config):
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        send_summary_test(Config.from_env())
+        config = Config.from_env()
+        print("Gemini API 연결을 확인합니다.", flush=True)
+        check_provider_connection()
+        print("Gemini API 키와 모델 연결을 확인했습니다.", flush=True)
+        send_summary_test(config)
         return 0
     except SummaryError as exc:
         diagnostics = [exc.code]

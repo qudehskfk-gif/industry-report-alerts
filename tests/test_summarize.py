@@ -244,7 +244,7 @@ def test_failures_report_fixed_stage_without_exposing_provider_contents(provider
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert error.value.code == expected_code
     assert error.value.status_code == expected_status
-    assert error.value.reason is None
+    assert error.value.reason == ("ReadTimeout" if isinstance(response, requests.ReadTimeout) else None)
     assert len(calls) == 1
     assert API_KEY not in str(error.value)
     assert API_KEY not in repr(vars(error.value))
@@ -261,3 +261,94 @@ def test_summary_error_normalizes_public_diagnostic_fields(code, status_code, re
     error = summarize.SummaryError("안전한 오류 안내", code=code, status_code=status_code, reason=reason)
     assert (error.code, error.status_code, error.reason) == expected
     assert API_KEY not in repr(vars(error))
+
+
+@pytest.mark.parametrize("error_type", [
+    requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout,
+    requests.exceptions.SSLError, requests.exceptions.ProxyError,
+    requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    requests.exceptions.RequestException,
+])
+def test_transport_diagnostic_uses_only_static_request_class_name(provider, error_type):
+    _, responses = provider
+    responses[:] = [error_type(f"Private error URL contains {API_KEY}")]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "transport_error"
+    assert error.value.reason == error_type.__name__
+    assert API_KEY not in repr(vars(error.value))
+    assert API_KEY not in str(error.value)
+
+
+@pytest.fixture
+def metadata_provider(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", API_KEY)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    calls, responses = [], [Response(data={"supportedGenerationMethods": ["generateContent", "countTokens"]})]
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        def post(self, *args, **kwargs):
+            pytest.fail("The connection check must never generate content")
+
+    monkeypatch.setattr(summarize.requests, "Session", Session)
+    return calls, responses
+
+
+def test_connection_probe_checks_model_with_header_key_and_no_generation(metadata_provider):
+    calls, _ = metadata_provider
+    assert summarize.check_provider_connection() is None
+    assert calls == [("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash", {
+        "headers": {"x-goog-api-key": API_KEY}, "timeout": (10, 15), "allow_redirects": False,
+    })]
+
+
+def test_connection_probe_preserves_safe_http_diagnostics(metadata_provider):
+    calls, responses = metadata_provider
+    responses[:] = [Response(400, {"error": {"message": API_KEY, "details": [
+        {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID"},
+    ]}})]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.check_provider_connection()
+    assert (error.value.code, error.value.status_code, error.value.reason) == ("http_400", 400, "API_KEY_INVALID")
+    assert len(calls) == 1
+    assert API_KEY not in str(error.value)
+    assert API_KEY not in repr(vars(error.value))
+
+
+@pytest.mark.parametrize("response,code,reason", [
+    (requests.ReadTimeout(API_KEY), "transport_error", "ReadTimeout"),
+    (Response(data=ValueError(API_KEY)), "response_json", None),
+    (Response(data=[API_KEY]), "response_schema", None),
+    (Response(data={"supportedGenerationMethods": ["countTokens"]}), "model_not_supported", None),
+])
+def test_connection_probe_failures_are_bounded_and_redacted(metadata_provider, response, code, reason):
+    calls, responses = metadata_provider
+    responses[:] = [response]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.check_provider_connection()
+    assert (error.value.code, error.value.reason) == (code, reason)
+    assert len(calls) == 1
+    assert API_KEY not in str(error.value)
+    assert API_KEY not in repr(vars(error.value))
+
+
+def test_connection_probe_missing_key_never_contacts_service(metadata_provider, monkeypatch):
+    calls, _ = metadata_provider
+    monkeypatch.delenv("GEMINI_API_KEY")
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.check_provider_connection()
+    assert error.value.code == "config_key"
+    assert calls == []

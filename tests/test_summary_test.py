@@ -55,6 +55,7 @@ def probe(tmp_path, monkeypatch):
     monkeypatch.setattr(summary_test, "make_session", lambda: nullcontext(object()))
     monkeypatch.setattr(summary_test, "resolve", lambda report, session: report)
     monkeypatch.setattr(summary_test, "download_pdf", lambda url: pdf)
+    monkeypatch.setattr(summary_test, "check_provider_connection", lambda: None)
     return config, reports, pdf, calls, original
 
 
@@ -139,5 +140,22 @@ def test_main_prints_only_fixed_summary_diagnostics(probe, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "SummaryError: http_400; HTTP 400; API_KEY_INVALID" in output
     assert "sensitive-api-key-and-response" not in output
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+def test_failed_connection_check_stops_before_pdf_download(probe, monkeypatch, capsys):
+    config, reports, pdf, calls, original = probe
+    monkeypatch.setattr(summary_test.Config, "from_env", lambda: config)
+    monkeypatch.setattr(summary_test, "download_pdf", lambda *args: pytest.fail("Connection check failed before PDF download"))
+
+    def fail():
+        raise summary_test.SummaryError("sensitive-error", code="transport_error", reason="ReadTimeout")
+
+    monkeypatch.setattr(summary_test, "check_provider_connection", fail)
+    assert summary_test.main() == 1
+    output = capsys.readouterr().out
+    assert "transport_error; ReadTimeout" in output
+    assert "sensitive-error" not in output
     assert calls == []
     assert config.state_path.read_bytes() == original

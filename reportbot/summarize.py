@@ -16,17 +16,22 @@ from .models import Report
 _ERROR_CODES = frozenset({
     "summary_error", "http_error", "quota_429", "transport_error",
     "response_json", "response_schema", "response_incomplete",
-    "config_mode", "config_model", "validation_pdf", "validation_page_count",
+    "config_mode", "config_model", "config_key", "model_not_supported", "validation_pdf", "validation_page_count",
     "validation_items", "validation_item", "validation_text",
     "validation_duplicate", "validation_pages",
 })
-_ERROR_REASONS = frozenset({
+_GOOGLE_ERROR_REASONS = frozenset({
     "API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_SERVICE_BLOCKED",
     "API_KEY_HTTP_REFERRER_BLOCKED", "API_KEY_IP_ADDRESS_BLOCKED",
     "EXPIRED", "SERVICE_BLOCKED", "HTTP_REFERRER_BLOCKED", "IP_ADDRESS_BLOCKED",
     "SERVICE_DISABLED", "BILLING_DISABLED", "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
     "CONSUMER_INVALID",
 })
+_TRANSPORT_ERROR_REASONS = frozenset({
+    "ReadTimeout", "ConnectTimeout", "SSLError", "ProxyError", "ConnectionError",
+    "Timeout", "RequestException",
+})
+_ERROR_REASONS = _GOOGLE_ERROR_REASONS | _TRANSPORT_ERROR_REASONS
 
 
 class SummaryError(RuntimeError):
@@ -52,9 +57,55 @@ def _error_reason(response) -> str | None:
             if not isinstance(detail, dict) or detail.get("@type") != "type.googleapis.com/google.rpc.ErrorInfo":
                 continue
             reason = detail.get("reason")
-            if isinstance(reason, str) and reason in _ERROR_REASONS:
+            if isinstance(reason, str) and reason in _GOOGLE_ERROR_REASONS:
                 return reason
     return None
+
+
+def _transport_reason(error: requests.RequestException) -> str:
+    # Keep only a fixed class name, never the exception message or request URL.
+    for name in ("ReadTimeout", "ConnectTimeout", "SSLError", "ProxyError", "ConnectionError", "Timeout"):
+        if isinstance(error, getattr(requests.exceptions, name)):
+            return name
+    return "RequestException"
+
+
+def _http_error(response) -> SummaryError:
+    return SummaryError("요약 서비스를 이용하지 못했습니다.",
+                        code="quota_429" if response.status_code == 429 else f"http_{response.status_code}",
+                        status_code=response.status_code, reason=_error_reason(response))
+
+
+def check_provider_connection() -> None:
+    """Check credentials and model availability without generating content."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise SummaryError("요약 서비스 API 키를 등록하세요.", code="config_key")
+    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
+        raise SummaryError("요약 모델 설정을 확인하세요.", code="config_model")
+    try:
+        with requests.Session() as session:
+            response = session.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}",
+                headers={"x-goog-api-key": api_key}, timeout=(10, 15), allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise _http_error(response)
+            try:
+                result = response.json()
+            except (ValueError, TypeError):
+                raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.", code="response_json") from None
+            if not isinstance(result, dict):
+                raise SummaryError("요약 모델 정보를 확인하지 못했습니다.", code="response_schema")
+            if "supportedGenerationMethods" in result and (
+                not isinstance(result["supportedGenerationMethods"], list)
+                or "generateContent" not in result["supportedGenerationMethods"]
+            ):
+                raise SummaryError("요약 모델의 콘텐츠 생성 지원을 확인하지 못했습니다.", code="model_not_supported")
+    except requests.RequestException as error:
+        raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.",
+                           code="transport_error", reason=_transport_reason(error)) from None
 
 
 DEFAULT_MODEL = "gemini-3.8-flash"
@@ -164,16 +215,15 @@ def summarize_pdf(report: Report, pdf_bytes: bytes, page_count: int | None) -> l
             if response.status_code == 429:
                 _QUOTA_BLOCKED.add(key_id)
             if response.status_code != 200:
-                raise SummaryError("요약 서비스를 이용하지 못했습니다.",
-                                   code="quota_429" if response.status_code == 429 else f"http_{response.status_code}",
-                                   status_code=response.status_code, reason=_error_reason(response))
+                raise _http_error(response)
             try:
                 response_body = response.json()
             except (ValueError, TypeError):
                 raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.", code="response_json") from None
             lines = _response_lines(response_body, page_count)
-    except requests.RequestException:
-        raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.", code="transport_error") from None
+    except requests.RequestException as error:
+        raise SummaryError("요약 서비스 연결 또는 응답을 확인하지 못했습니다.",
+                           code="transport_error", reason=_transport_reason(error)) from None
     _CACHE[cache_key] = tuple(lines)
     _CACHE.move_to_end(cache_key)
     while len(_CACHE) > 128:
