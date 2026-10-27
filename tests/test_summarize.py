@@ -142,7 +142,7 @@ def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
     elif invalid == "many-pages": items[0]["pages"] = [1, 2, 3, 4]
     elif invalid == "string-page": items[0]["pages"] = ["1"]
     elif invalid == "not-object": items[0] = "산업 수요"
-    responses[:] = [Response(data=body(items))]
+    responses[:] = [Response(data=body(items)), Response(data=body(items))]
     with pytest.raises(summarize.SummaryError):
         summarize.summarize_pdf(REPORT, PDF, 20)
 
@@ -171,6 +171,62 @@ def test_compact_summary_does_not_silently_clip_long_or_hidden_line_breaks(text)
 def test_shared_display_width_counts_korean_and_ascii_for_mobile_lines():
     assert summarize.summary_text_width("기판 AI 2배") == 11
     assert summarize.summary_text_width("10. " + "가" * 18) == 40
+
+
+@pytest.mark.parametrize("problem", ["long", "duplicate", "count"])
+def test_one_ai_rewrite_can_recompress_invalid_draft_without_cutting_it(provider, problem):
+    calls, responses = provider
+    draft = summary_items()
+    if problem == "long":
+        draft[0]["text"] = "가" * 21
+    elif problem == "duplicate":
+        draft[1]["text"] = draft[0]["text"]
+    else:
+        draft.pop()
+    responses[:] = [Response(data=body(draft)), Response()]
+    result = summarize.summarize_pdf(REPORT, PDF, 20)
+    assert result == [item["text"] for item in summary_items()]
+    assert len(calls) == 2
+    first, second = [options["json"] for _, options in calls]
+    assert len(first["contents"]) == 1
+    assert second["contents"][0] == first["contents"][0]
+    assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"items": draft}
+    assert "기계적으로 자르지" in second["contents"][2]["parts"][0]["text"]
+    assert "12~16자" in second["contents"][2]["parts"][0]["text"]
+    assert "maxLength" not in first["generationConfig"]["responseSchema"]["properties"]["items"]["items"]["properties"]["text"]
+    assert "12~16자" in first["generationConfig"]["responseSchema"]["properties"]["items"]["items"]["properties"]["text"]["description"]
+
+
+def test_failed_ai_rewrite_stops_after_two_requests_and_caches_nothing(provider):
+    calls, responses = provider
+    invalid = summary_items()
+    invalid[0]["text"] = "너무 긴 문장을 자동으로 잘라서 보내면 안 됩니다"
+    responses[:] = [Response(data=body(invalid)), Response(data=body(invalid))]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_text"
+    assert len(calls) == 2
+    assert not summarize._CACHE
+
+
+def test_invalid_page_evidence_never_triggers_a_rewrite(provider):
+    calls, responses = provider
+    invalid = summary_items()
+    invalid[0]["pages"] = [21]
+    responses[:] = [Response(data=body(invalid))]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_pages"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("response", [Response(401), Response(503), Response(429), requests.ReadTimeout(API_KEY)])
+def test_http_quota_and_transport_failures_never_trigger_ai_rewrite(provider, response):
+    calls, responses = provider
+    responses[:] = [response]
+    with pytest.raises(summarize.SummaryError):
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("response", [
@@ -270,13 +326,13 @@ def test_http_diagnostics_discard_unrecognized_and_malformed_provider_details(pr
 ])
 def test_failures_report_fixed_stage_without_exposing_provider_contents(provider, response, expected_code, expected_status):
     calls, responses = provider
-    responses[:] = [response]
+    responses[:] = [response, response] if expected_code in {"validation_items", "validation_text", "validation_duplicate"} else [response]
     with pytest.raises(summarize.SummaryError) as error:
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert error.value.code == expected_code
     assert error.value.status_code == expected_status
     assert error.value.reason == ("ReadTimeout" if isinstance(response, requests.ReadTimeout) else None)
-    assert len(calls) == 1
+    assert len(calls) == (2 if expected_code in {"validation_items", "validation_text", "validation_duplicate"} else 1)
     assert API_KEY not in str(error.value)
     assert API_KEY not in repr(vars(error.value))
 
