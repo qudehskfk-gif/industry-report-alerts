@@ -279,12 +279,84 @@ def test_one_ai_rewrite_can_fix_section_shape_or_length_semantically(provider, p
     assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
     assert len(calls) == 2
     first, second = [options["json"] for _, options in calls]
-    assert second["contents"][0] == first["contents"][0]
-    assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"sections": draft}
-    assert "기계적으로 자르지" in second["contents"][2]["parts"][0]["text"]
-    assert "원인·근거·의미" in second["contents"][2]["parts"][0]["text"]
     if problem == "budget":
-        assert "앞선 요약의 실제 표시 길이는" in second["contents"][2]["parts"][0]["text"]
+        assert "inlineData" not in json.dumps(second)
+        assert calls[1][0].endswith("/gemini-3.5-flash-lite:generateContent")
+        assert "직전 초안의 실제 표시 길이는" in second["contents"][0]["parts"][0]["text"]
+        assert "기계적으로 자르지" in second["systemInstruction"]["parts"][0]["text"]
+        schema = second["generationConfig"]["responseSchema"]["properties"]["sections"]
+        assert schema["minItems"] == schema["maxItems"] == 5
+        points = schema["items"]["properties"]["points"]
+        assert points["minItems"] == points["maxItems"] == 3
+    else:
+        assert second["contents"][0] == first["contents"][0]
+        assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"sections": draft}
+        assert "기계적으로 자르지" in second["contents"][2]["parts"][0]["text"]
+        assert "원인·근거·의미" in second["contents"][2]["parts"][0]["text"]
+
+
+def items_with_units(units, count=5):
+    items = summary_items(count, 3)
+    used = len(summarize.summary_body_text(normalized(items)).encode("utf-16-le")) // 2
+    items[-1]["points"][-1]["text"] += "가" * (units - used)
+    assert len(summarize.summary_body_text(normalized(items)).encode("utf-16-le")) // 2 == units
+    return items
+
+
+def test_two_gemini_compression_passes_can_fix_1374_then_1312_units(provider):
+    calls, responses = provider
+    responses[:] = [Response(data=body(items_with_units(1374))),
+                    Response(data=body(items_with_units(1312))), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 3
+    assert "inlineData" in calls[0][1]["json"]["contents"][0]["parts"][0]
+    for url, options in calls[1:]:
+        assert url.endswith("/gemini-3.5-flash-lite:generateContent")
+        assert "inlineData" not in json.dumps(options["json"])
+        schema = options["json"]["generationConfig"]["responseSchema"]["properties"]["sections"]
+        assert schema["minItems"] == schema["maxItems"] == 5
+    assert "1312" in calls[2][1]["json"]["contents"][0]["parts"][0]["text"]
+
+
+def test_compression_server_retry_and_second_edit_share_four_request_ceiling(provider, retry_waits):
+    calls, responses = provider
+    responses[:] = [Response(data=body(items_with_units(1374))), Response(503),
+                    Response(data=body(items_with_units(1312))), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 4 and retry_waits == [5]
+    assert calls[1][1]["json"] == calls[2][1]["json"]
+    assert all("inlineData" not in json.dumps(options["json"]) for _, options in calls[1:])
+
+
+def test_two_failed_compression_passes_stop_without_a_third_edit(provider):
+    calls, responses = provider
+    responses[:] = [Response(data=body(items_with_units(units))) for units in [1374, 1312, 1250]]
+    responses.append(Response())
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_budget"
+    assert len(calls) == 3 and len(responses) == 1
+    assert not summarize._CACHE
+
+
+def test_compression_cannot_invent_a_new_page_reference(provider):
+    calls, responses = provider
+    compressed = summary_items()
+    compressed[0]["points"][0]["pages"] = [2]
+    responses[:] = [Response(data=body(items_with_units(1374))), Response(data=body(compressed))]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "validation_pages" and len(calls) == 2
+    assert not summarize._CACHE
+
+
+def test_three_topic_compression_keeps_three_topics_and_three_points(provider):
+    calls, responses = provider
+    items = summary_items(3, 3)
+    responses[:] = [Response(data=body(items_with_units(1374, 3))), Response(data=body(items))]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized(items)
+    schema = calls[1][1]["json"]["generationConfig"]["responseSchema"]["properties"]["sections"]
+    assert schema["minItems"] == schema["maxItems"] == 3
 
 
 def test_budget_rewrite_logs_only_lengths_and_codes(provider, caplog):
