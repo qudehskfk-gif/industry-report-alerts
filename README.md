@@ -73,7 +73,7 @@ Telegram의 PDF 설명은 실제 표시되는 글 기준 최대 1024 UTF-16 단�
 1. [Google AI Studio의 API 키 화면](https://aistudio.google.com/api-keys)에 Google 계정으로 로그인합니다.
 2. **Create API key**에서 새 프로젝트의 API 키를 만듭니다. 프로젝트의 사용 등급이 **Free tier**인지 확인하고 유료 결제는 연결하지 않습니다.
 3. [GitHub 새 Secret 등록 화면](https://github.com/qudehskfk-gif/industry-report-alerts/settings/secrets/actions/new)을 엽니다. **Name**에 `GEMINI_API_KEY`, **Secret**에 복사한 API 키를 붙여 넣고 **Add secret**을 누릅니다. 기존 `TELEGRAM_BOT_TOKEN`과 `TELEGRAM_CHAT_ID`는 그대로 둡니다.
-4. GitHub **Actions → Test report summary → Run workflow**를 실행합니다. 가장 최근에 발송한 리포트 한 건을 골라 **큰 제목과 부가 설명을 넣은 PDF 메시지 한 건**을 현재 수신처로 보냅니다. 새 자료가 없어도 완성된 발송 형식을 시험할 수 있으며, 기존 발송 기록은 읽기만 하고 변경하지 않습니다.
+4. GitHub **Actions → Test report summary → Run workflow**를 실행합니다. `report_date`를 비우면 가장 최근에 발송한 리포트 한 건을 골라 **큰 제목과 부가 설명을 넣은 PDF 메시지 한 건**을 현재 수신처로 보냅니다. 한국 날짜를 `YYYY-MM-DD`로 넣으면 그날 발송했던 모든 보고서를 각각 요약과 PDF를 합친 메시지로 그룹방에 다시 보냅니다. 날짜별 발송은 모든 요약을 준비한 뒤 시작하며, 원본 PDF 해시와 그룹 수신처를 확인합니다. 기존 발송 기록은 읽기만 하고 변경하지 않으며, 같은 날짜로 다시 실행하면 이미 받은 자료도 재전송됩니다.
 
 봇은 첨부할 **PDF 전체를 Google Gemini API로 전송**해 본문·표·차트를 요약합니다. 기본 모델은 `gemini-3.1-flash-lite`입니다. API 키나 요약 본문을 공개 알림 DB에 저장하지 않습니다.
 

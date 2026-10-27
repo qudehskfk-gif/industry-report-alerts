@@ -2,6 +2,12 @@ name: Test report summary
 
 on:
   workflow_dispatch:
+    inputs:
+      report_date:
+        description: '발송했던 한국 날짜 YYYY-MM-DD (비우면 최근 보고서 1건)'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -13,12 +19,13 @@ concurrency:
 jobs:
   test-summary:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI }}
       STATE_PATH: test-state.sqlite3
+      REPORT_DATE: ${{ inputs.report_date }}
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Check summary key
@@ -38,5 +45,11 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Send one PDF with headings and supporting summary lines
-        run: python -m reportbot.summary_test
+      - name: Send selected PDFs with headings and supporting summary lines
+        shell: bash
+        run: |
+          if [[ -n "$REPORT_DATE" ]]; then
+            python -m reportbot.summary_test --date "$REPORT_DATE"
+          else
+            python -m reportbot.summary_test
+          fi

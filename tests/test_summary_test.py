@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from datetime import date
+import hashlib
 import io
 import sqlite3
 
@@ -30,7 +31,6 @@ def probe(tmp_path, monkeypatch):
         with state.db:
             state.db.execute("UPDATE reports SET processed_at=? WHERE source_id=?", (timestamp, source_id))
     state.close()
-    original = config.state_path.read_bytes()
 
     writer = PdfWriter()
     writer.add_blank_page(width=100, height=100)
@@ -47,7 +47,9 @@ def probe(tmp_path, monkeypatch):
         def send(self, text):
             pytest.fail("The summary must be part of the PDF caption, not a separate message")
 
-        def call(self, method, payload, *, files):
+        def call(self, method, payload, *, files=None):
+            if method == "getChat":
+                return {"id": int(config.chat_id), "type": "group"}
             assert method == "sendDocument"
             filename, document, mime = files["document"]
             calls.append((method, payload, document.read(), filename, mime))
@@ -58,7 +60,38 @@ def probe(tmp_path, monkeypatch):
     monkeypatch.setattr(summary_test, "resolve", lambda report, session: report)
     monkeypatch.setattr(summary_test, "download_pdf", lambda url: pdf)
     monkeypatch.setattr(summary_test, "check_provider_connection", lambda: None)
+    monkeypatch.setattr(summary_test.time, "sleep", lambda seconds: None)
+    with sqlite3.connect(config.state_path) as database:
+        database.execute("UPDATE reports SET pdf_hash=?", (hashlib.sha256(pdf).hexdigest(),))
+    original = config.state_path.read_bytes()
     return config, reports, pdf, calls, original
+
+
+def sections():
+    return [{"heading": f"핵심 주제 {index}",
+             "points": [f"수요 변화의 근거 {index}-{point}" for point in range(1, 4)]}
+            for index in range(1, 6)]
+
+
+@pytest.fixture
+def batch_probe(probe):
+    config, reports, pdf, calls, _ = probe
+    state = State(config.state_path)
+    # The first UTC time belongs to the next Korean date. The last is just
+    # before that Korean date ends; unrelated pending/error rows are excluded.
+    for source_id, timestamp in [
+        ("today-first", "2026-10-26 15:00:00"),
+        ("today-second", "2026-10-27 01:00:00"),
+        ("today-third", "2026-10-27 14:59:59"),
+    ]:
+        item = Report("naver", source_id, f"산업 분석 {source_id}", "테스트증권", date(2026, 10, 21),
+                      f"https://example.com/{source_id}", f"https://example.com/{source_id}.pdf")
+        state.record(item, "sent", hashlib.sha256(pdf).hexdigest())
+        with state.db:
+            state.db.execute("UPDATE reports SET processed_at=? WHERE source_id=?", (timestamp, source_id))
+        reports[source_id] = item
+    state.close()
+    return config, reports, pdf, calls, config.state_path.read_bytes()
 
 
 def test_latest_actual_delivery_is_summarized_with_read_only_state(probe, monkeypatch, capsys):
@@ -192,5 +225,91 @@ def test_failed_connection_check_stops_before_pdf_download(probe, monkeypatch, c
     output = capsys.readouterr().out
     assert "transport_error; ReadTimeout" in output
     assert "sensitive-error" not in output
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+def test_date_batch_prepares_all_three_before_sending_native_pdfs(batch_probe, monkeypatch, capsys):
+    config, reports, pdf, calls, original = batch_probe
+    prepared, waits = [], []
+
+    def summarize(item, data, pages):
+        assert calls == []
+        prepared.append(item.source_id)
+        return sections()
+
+    monkeypatch.setattr(summary_test, "summarize_pdf", summarize)
+    monkeypatch.setattr(summary_test.time, "sleep", waits.append)
+    summary_test.send_summary_test(config, date(2026, 10, 27))
+
+    assert prepared == ["today-first", "today-second", "today-third"]
+    assert len(calls) == 3
+    assert waits == [3.1, 3.1]
+    for method, payload, attached, filename, mime in calls:
+        assert method == "sendDocument" and attached == pdf
+        assert payload["caption"].count("\n• ") == 15
+        assert mime == "application/pdf" and filename.endswith(".pdf")
+    assert "요약·PDF 발송 완료 3/3" in capsys.readouterr().out
+    assert config.state_path.read_bytes() == original
+
+
+def test_batch_generation_failure_sends_nothing_and_keeps_ledger(batch_probe, monkeypatch):
+    config, reports, pdf, calls, original = batch_probe
+    prepared = []
+
+    def summarize(item, data, pages):
+        prepared.append(item.source_id)
+        if item.source_id == "today-second":
+            raise summary_test.SummaryError("private-response", code="http_503", status_code=503)
+        return sections()
+
+    monkeypatch.setattr(summary_test, "summarize_pdf", summarize)
+    with pytest.raises(summary_test.SummaryError):
+        summary_test.send_summary_test(config, date(2026, 10, 27))
+    assert prepared == ["today-first", "today-second"]
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+def test_batch_missing_summary_never_falls_back_to_pdf_only(batch_probe, monkeypatch):
+    config, reports, pdf, calls, original = batch_probe
+    monkeypatch.setattr(summary_test, "summarize_pdf", lambda *args: None)
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+        summary_test.send_summary_test(config, date(2026, 10, 27))
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+def test_batch_rejects_changed_pdf_before_generation_or_delivery(batch_probe, monkeypatch):
+    config, reports, pdf, calls, original = batch_probe
+    monkeypatch.setattr(summary_test, "download_pdf", lambda url: pdf + b"changed")
+    monkeypatch.setattr(summary_test, "summarize_pdf", lambda *args: pytest.fail("Do not summarize an unverified original"))
+    with pytest.raises(ValueError, match="일치하지 않습니다"):
+        summary_test.send_summary_test(config, date(2026, 10, 27))
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("chat", [
+    {"id": -5, "type": "group"},
+    {"id": -100424242, "type": "private"},
+])
+def test_batch_checks_group_identity_before_preparing_reports(batch_probe, monkeypatch, chat):
+    config, reports, pdf, calls, original = batch_probe
+    monkeypatch.setattr(summary_test.Telegram, "call", lambda *args, **kwargs: chat)
+    monkeypatch.setattr(summary_test, "download_pdf", lambda *args: pytest.fail("Invalid group must stop before downloading"))
+    with pytest.raises(summary_test.TelegramError, match="그룹방 수신처"):
+        summary_test.send_summary_test(config, date(2026, 10, 27))
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
+def test_main_passes_the_requested_korean_delivery_date(probe, monkeypatch):
+    config, reports, pdf, calls, original = probe
+    selected = []
+    monkeypatch.setattr(summary_test.Config, "from_env", lambda: config)
+    monkeypatch.setattr(summary_test, "send_summary_test", lambda conf, day: selected.append((conf, day)))
+    assert summary_test.main(["--date", "2026-10-27"]) == 0
+    assert selected == [(config, date(2026, 10, 27))]
     assert calls == []
     assert config.state_path.read_bytes() == original
