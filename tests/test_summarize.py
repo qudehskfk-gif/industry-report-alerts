@@ -186,3 +186,78 @@ def test_invalid_settings_never_contact_provider(provider, monkeypatch, name, va
     with pytest.raises(summarize.SummaryError):
         summarize.summarize_pdf(REPORT, PDF, 20)
     assert calls == []
+
+
+@pytest.mark.parametrize("reason", [
+    "API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_SERVICE_BLOCKED",
+    "API_KEY_HTTP_REFERRER_BLOCKED", "API_KEY_IP_ADDRESS_BLOCKED",
+    "SERVICE_DISABLED", "BILLING_DISABLED", "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    "CONSUMER_INVALID",
+])
+def test_http_diagnostics_only_retain_allowlisted_error_info_reason(provider, reason):
+    _, responses = provider
+    responses[:] = [Response(403, {"error": {
+        "message": f"Private provider message contains {API_KEY}",
+        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": reason,
+                     "metadata": {"key": API_KEY}}],
+    }})]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == "http_403"
+    assert error.value.status_code == 403
+    assert error.value.reason == reason
+    assert API_KEY not in str(error.value)
+    assert API_KEY not in repr(vars(error.value))
+
+
+@pytest.mark.parametrize("data", [
+    {"error": {"reason": "API_KEY_INVALID", "message": API_KEY}},
+    {"error": {"details": [{"reason": "API_KEY_INVALID", "message": API_KEY}]}},
+    {"error": {"details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": API_KEY}]}},
+    {"error": {"details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": [API_KEY]}]}},
+    {"error": API_KEY},
+    ValueError(API_KEY),
+])
+def test_http_diagnostics_discard_unrecognized_and_malformed_provider_details(provider, data):
+    _, responses = provider
+    responses[:] = [Response(400, data)]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert (error.value.code, error.value.status_code, error.value.reason) == ("http_400", 400, None)
+    assert API_KEY not in str(error.value)
+    assert API_KEY not in repr(vars(error.value))
+
+
+@pytest.mark.parametrize("response,expected_code,expected_status", [
+    (Response(404, {"error": API_KEY}), "http_404", 404),
+    (Response(429, {"error": API_KEY}), "quota_429", 429),
+    (Response(data=ValueError(API_KEY)), "response_json", None),
+    (Response(data={}), "response_schema", None),
+    (Response(data=body(finish="MAX_TOKENS")), "response_incomplete", None),
+    (Response(data=body(items=[])), "validation_items", None),
+    (requests.ReadTimeout(API_KEY), "transport_error", None),
+])
+def test_failures_report_fixed_stage_without_exposing_provider_contents(provider, response, expected_code, expected_status):
+    calls, responses = provider
+    responses[:] = [response]
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.summarize_pdf(REPORT, PDF, 20)
+    assert error.value.code == expected_code
+    assert error.value.status_code == expected_status
+    assert error.value.reason is None
+    assert len(calls) == 1
+    assert API_KEY not in str(error.value)
+    assert API_KEY not in repr(vars(error.value))
+
+
+@pytest.mark.parametrize("code,status_code,reason,expected", [
+    (API_KEY, True, API_KEY, ("summary_error", None, None)),
+    ({"private": API_KEY}, 600, [API_KEY], ("summary_error", None, None)),
+    ("http_099", 99, None, ("summary_error", None, None)),
+    ("http_600", "403", None, ("summary_error", None, None)),
+    ("http_401", 401, "API_KEY_INVALID", ("http_401", 401, "API_KEY_INVALID")),
+])
+def test_summary_error_normalizes_public_diagnostic_fields(code, status_code, reason, expected):
+    error = summarize.SummaryError("안전한 오류 안내", code=code, status_code=status_code, reason=reason)
+    assert (error.code, error.status_code, error.reason) == expected
+    assert API_KEY not in repr(vars(error))

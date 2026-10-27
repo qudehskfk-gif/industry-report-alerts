@@ -122,3 +122,22 @@ def test_main_redacts_api_errors(probe, monkeypatch, capsys):
     assert "sensitive-api-key-and-response" not in output
     assert calls == []
     assert config.state_path.read_bytes() == original
+
+
+def test_main_prints_only_fixed_summary_diagnostics(probe, monkeypatch, capsys):
+    config, reports, pdf, calls, original = probe
+    monkeypatch.setattr(summary_test.Config, "from_env", lambda: config)
+
+    def fail(*args):
+        raise summary_test.SummaryError(
+            "sensitive-api-key-and-response", code="http_400", status_code=400,
+            reason="API_KEY_INVALID",
+        )
+
+    monkeypatch.setattr(summary_test, "summarize_pdf", fail)
+    assert summary_test.main() == 1
+    output = capsys.readouterr().out
+    assert "SummaryError: http_400; HTTP 400; API_KEY_INVALID" in output
+    assert "sensitive-api-key-and-response" not in output
+    assert calls == []
+    assert config.state_path.read_bytes() == original

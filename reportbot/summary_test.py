@@ -11,7 +11,7 @@ from .config import Config
 from .http import make_session
 from .runner import resolve
 from .state import State
-from .summarize import summarize_pdf
+from .summarize import SummaryError, summarize_pdf
 from .telegram import Telegram, download_pdf, report_summary_message
 
 
@@ -43,6 +43,14 @@ def main() -> int:
     try:
         send_summary_test(Config.from_env())
         return 0
+    except SummaryError as exc:
+        diagnostics = [exc.code]
+        if exc.status_code is not None:
+            diagnostics.append(f"HTTP {exc.status_code}")
+        if exc.reason:
+            diagnostics.append(exc.reason)
+        print(f"요약 테스트를 완료하지 못했습니다 (SummaryError: {'; '.join(diagnostics)}). API 키와 무료 사용 한도를 확인하세요.")
+        return 1
     except Exception as exc:
         print(f"요약 테스트를 완료하지 못했습니다 ({type(exc).__name__}). API 키와 무료 사용 한도를 확인하세요.")
         return 1
