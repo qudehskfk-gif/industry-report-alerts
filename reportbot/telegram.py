@@ -10,7 +10,7 @@ import requests
 from .classify import Decision, MAX_PDF_BYTES
 from .http import make_session
 from .models import Report
-from .summarize import summarize_pdf
+from .summarize import SummaryError, summarize_pdf, validate_summary_lines
 
 log = logging.getLogger(__name__)
 
@@ -100,25 +100,39 @@ def report_error_message(report: Report, reason: str) -> str:
     return text + "\n" + link
 
 
-def report_summary_message(report: Report, summary: list[str]) -> str:
-    """Format ten validated summary lines without trusting generated HTML."""
-    if not isinstance(summary, list) or len(summary) != 10 or any(
-        not isinstance(line, str) or not line.strip() or "\n" in line or "\r" in line
-        for line in summary
-    ):
-        raise TelegramError("리포트 요약은 비어 있지 않은 열 줄이어야 합니다.")
-    lines = [
-        "📝 <b>AI 리포트 10줄 요약</b>",
-        f"<b>{_escaped_trim(report.title, 350)}</b>",
-        f"{_escaped_trim(report.broker, 90)} · {report.published_date.isoformat()}",
-    ]
+def report_summary_caption(report: Report, decision: Decision, summary: list[str]) -> str:
+    """Put ten complete, compact lines in the PDF's single message caption."""
+    try:
+        summary = validate_summary_lines(summary)
+    except SummaryError:
+        raise TelegramError("리포트 요약은 짧고 서로 다른 열 줄이어야 합니다.") from None
+    source = {"hankyung": "한경 컨센서스", "naver": "네이버 금융"}.get(report.source, report.source)
+    pages = f"{decision.pages}쪽" if decision.pages is not None else "쪽수 미확인"
+    metadata = [_escaped_trim(source, 24)]
     if report.sector:
-        lines.append(f"섹터: {_escaped_trim(report.sector, 80)}")
-    lines += [f"{index}. {_escaped_trim(line.strip(), 260)}" for index, line in enumerate(summary, 1)]
-    message = "\n".join(lines)
-    if _utf16_length(message) > 4096:
-        raise TelegramError("리포트 요약이 텔레그램 길이 제한을 초과했습니다.")
-    return message
+        metadata.insert(0, f"섹터: {_escaped_trim(report.sector, 40)}")
+    metadata.append(_escaped_trim(pages, 20))
+    lines = [
+        f"📚 <b>{_escaped_trim(report.title, 120)}</b>",
+        f"{_escaped_trim(report.broker, 45)} · {report.published_date.isoformat()}",
+        " · ".join(metadata),
+        "",
+        "📝 <b>AI 핵심 요약 10줄</b>",
+    ]
+    # Escape generated text as text, never truncate it into incomplete thoughts.
+    lines += [f"{index}. {html.escape(line, quote=False)}" for index, line in enumerate(summary, 1)]
+    caption = "\n".join(lines)
+    if _utf16_length(caption) > 1024:
+        raise TelegramError("리포트 요약이 PDF 설명 길이 제한을 초과했습니다.")
+    link = f'<a href="{html.escape(report.detail_url, quote=True)}">원문 페이지</a>'
+    if _utf16_length(caption + "\n" + link) <= 1024:
+        caption += "\n" + link
+    return caption
+
+
+def report_summary_message(report: Report, summary: list[str]) -> str:
+    """Keep the compact formatter available for callers of the old helper."""
+    return report_summary_caption(report, Decision(True, "AI 요약"), summary)
 
 
 def download_pdf(url: str) -> bytes:
@@ -212,8 +226,7 @@ class Telegram:
         try:
             summary = summarize_pdf(report, data, decision.pages)
             if summary is not None:
-                self.send(report_summary_message(report, summary))
-                time.sleep(1.1)
+                caption = report_summary_caption(report, decision, summary)
         except Exception as exc:
             # A failed optional summary must never stop or permanently reject
             # the PDF; remote errors may contain credentials or source text.

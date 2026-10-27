@@ -16,7 +16,7 @@ REPORT = Report("naver", "100", "반도체 산업 구조 변화", "미래증권"
 
 
 def summary_items():
-    return [{"text": f"산업 수요 전망의 핵심 근거 {index}", "pages": [3, 1, 3]} for index in range(1, 11)]
+    return [{"text": f"산업 수요 전망 개선 {index}", "pages": [3, 1, 3]} for index in range(1, 11)]
 
 
 def body(items=None, finish="STOP"):
@@ -73,7 +73,7 @@ def test_summary_sends_whole_pdf_and_header_key_then_validates_ten_grounded_line
     calls, _ = provider
     lines = summarize.summarize_pdf(REPORT, PDF, 20)
     assert len(lines) == 10
-    assert lines[0] == "산업 수요 전망의 핵심 근거 1 (p.1, 3)"
+    assert lines[0] == "산업 수요 전망 개선 1"
     assert "Internal reasoning" not in "\n".join(lines)
     [(url, options)] = calls
     assert url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
@@ -88,6 +88,10 @@ def test_summary_sends_whole_pdf_and_header_key_then_validates_ten_grounded_line
     assert inline["mimeType"] == "application/pdf"
     assert base64.b64decode(inline["data"]) == PDF
     assert payload["generationConfig"]["responseMimeType"] == "application/json"
+    assert all(len(line) <= summarize.MAX_SUMMARY_CHARS for line in lines)
+    assert all(summarize.summary_text_width(f"{index}. {line}") <= 40 for index, line in enumerate(lines, 1))
+    assert all("(p." not in line for line in lines)
+    assert "원문 문장을 발췌" in payload["systemInstruction"]["parts"][0]["text"]
 
 
 def test_no_key_or_off_does_not_contact_provider(provider, monkeypatch):
@@ -118,7 +122,7 @@ def test_memory_cache_returns_copy_and_is_scoped_to_key_and_model(provider, monk
 
 
 @pytest.mark.parametrize("invalid", [
-    "count", "empty", "english", "multiline", "long", "duplicate", "boolean-page",
+    "count", "empty", "english", "multiline", "long", "wide", "duplicate", "boolean-page",
     "zero-page", "outside-page", "no-page", "many-pages", "string-page", "not-object",
 ])
 def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
@@ -128,7 +132,8 @@ def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
     elif invalid == "empty": items[0]["text"] = " "
     elif invalid == "english": items[0]["text"] = "Only English sentence"
     elif invalid == "multiline": items[0]["text"] = "산업 수요\n새로운 줄"
-    elif invalid == "long": items[0]["text"] = "가" * 161
+    elif invalid == "long": items[0]["text"] = "가" * 21
+    elif invalid == "wide": items[0]["text"] = "가" * 19
     elif invalid == "duplicate": items[1]["text"] = items[0]["text"]
     elif invalid == "boolean-page": items[0]["pages"] = [True]
     elif invalid == "zero-page": items[0]["pages"] = [0]
@@ -140,6 +145,32 @@ def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
     responses[:] = [Response(data=body(items))]
     with pytest.raises(summarize.SummaryError):
         summarize.summarize_pdf(REPORT, PDF, 20)
+
+
+@pytest.mark.parametrize("text", ["가" * 18, "가" + "A" * 19])
+def test_compact_summary_preserves_complete_text_at_both_limits(provider, text):
+    _, responses = provider
+    items = summary_items()
+    items[0]["text"] = text
+    responses[:] = [Response(data=body(items))]
+    lines = summarize.summarize_pdf(REPORT, PDF, 20)
+    assert lines[0] == text
+    assert len(lines) == 10
+    assert all("…" not in line and "(p." not in line for line in lines)
+
+
+@pytest.mark.parametrize("text", ["가" * 19, "가" + "A" * 20, "수요\u2028개선", "성장\u200b전망", "1. 기판 수요 개선"])
+def test_compact_summary_does_not_silently_clip_long_or_hidden_line_breaks(text):
+    lines = [f"수요 개선 {index}" for index in range(10)]
+    lines[0] = text
+    with pytest.raises(summarize.SummaryError) as error:
+        summarize.validate_summary_lines(lines)
+    assert error.value.code == "validation_text"
+
+
+def test_shared_display_width_counts_korean_and_ascii_for_mobile_lines():
+    assert summarize.summary_text_width("기판 AI 2배") == 11
+    assert summarize.summary_text_width("10. " + "가" * 18) == 40
 
 
 @pytest.mark.parametrize("response", [

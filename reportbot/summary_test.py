@@ -1,4 +1,4 @@
-"""Send one summary of a delivered report without repeating its PDF."""
+"""Send one delivered report as a PDF with a compact ten-line summary caption."""
 
 import io
 import logging
@@ -7,12 +7,13 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
+from .classify import Decision
 from .config import Config
 from .http import make_session
 from .runner import resolve
 from .state import State
 from .summarize import SummaryError, check_provider_connection, summarize_pdf
-from .telegram import Telegram, download_pdf, report_summary_message
+from .telegram import Telegram, TelegramError, download_pdf, pdf_filename, report_summary_caption
 
 
 def send_summary_test(config: Config):
@@ -34,9 +35,15 @@ def send_summary_test(config: Config):
     summary = summarize_pdf(report, data, pages)
     if summary is None:
         raise ValueError("GEMINI_API_KEY Secret을 등록해야 요약을 시험할 수 있습니다.")
-    result = Telegram(config.token, config.chat_id).send(report_summary_message(report, summary))
-    destination = result.get("chat", {}).get("type") if isinstance(result, dict) else None
-    print("그룹방으로 10줄 요약 테스트를 보냈습니다." if destination in {"group", "supergroup"} else "설정된 대화방으로 10줄 요약 테스트를 보냈습니다.")
+    caption = report_summary_caption(report, Decision(True, f"산업 리포트 {pages}쪽", pages), summary)
+    with io.BytesIO(data) as document:
+        result = Telegram(config.token, config.chat_id).call("sendDocument", {
+            "chat_id": config.chat_id, "caption": caption, "parse_mode": "HTML",
+        }, files={"document": (pdf_filename(report), document, "application/pdf")})
+    if not isinstance(result, dict) or not isinstance(result.get("document"), dict) or not isinstance(result.get("chat"), dict):
+        raise TelegramError("요약과 PDF가 포함된 메시지의 첨부 완료 응답을 확인하지 못했습니다.")
+    destination = result["chat"].get("type")
+    print("그룹방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다." if destination in {"group", "supergroup"} else "설정된 대화방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다.")
 
 
 def main() -> int:

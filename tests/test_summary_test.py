@@ -45,11 +45,13 @@ def probe(tmp_path, monkeypatch):
             assert (token, chat_id) == (config.token, config.chat_id)
 
         def send(self, text):
-            calls.append(text)
-            return {"message_id": 1, "chat": {"type": "group"}}
+            pytest.fail("The summary must be part of the PDF caption, not a separate message")
 
-        def send_report(self, *args):
-            pytest.fail("A summary test must not re-send the PDF")
+        def call(self, method, payload, *, files):
+            assert method == "sendDocument"
+            filename, document, mime = files["document"]
+            calls.append((method, payload, document.read(), filename, mime))
+            return {"message_id": 1, "chat": {"type": "group"}, "document": {"file_id": "test-pdf"}}
 
     monkeypatch.setattr(summary_test, "Telegram", Telegram)
     monkeypatch.setattr(summary_test, "make_session", lambda: nullcontext(object()))
@@ -73,7 +75,7 @@ def test_latest_actual_delivery_is_summarized_with_read_only_state(probe, monkey
 
     def summarize(report, data, pages):
         received.append((report, data, pages))
-        return [f"산업 전망 {index} (p.1)" for index in range(1, 11)]
+        return [f"산업 전망 {index}" for index in range(1, 11)]
 
     monkeypatch.setattr(summary_test.sqlite3, "connect", read_only_connect)
     monkeypatch.setattr(summary_test, "summarize_pdf", summarize)
@@ -82,9 +84,17 @@ def test_latest_actual_delivery_is_summarized_with_read_only_state(probe, monkey
     assert len(connections) == 1
     assert received == [(reports["latest-sent"], pdf, 2)]
     assert len(calls) == 1
-    assert "산업 분석 latest-sent" in calls[0]
-    assert "10. 산업 전망 10 (p.1)" in calls[0]
-    assert "그룹방으로 10줄 요약 테스트를 보냈습니다." in capsys.readouterr().out
+    method, payload, attachment, filename, mime = calls[0]
+    assert method == "sendDocument"
+    assert payload["chat_id"] == config.chat_id
+    assert payload["parse_mode"] == "HTML"
+    assert "산업 분석 latest-sent" in payload["caption"]
+    assert "10. 산업 전망 10" in payload["caption"]
+    assert "(p." not in payload["caption"]
+    assert attachment == pdf
+    assert filename.endswith(".pdf")
+    assert mime == "application/pdf"
+    assert "그룹방으로 10줄 요약과 PDF 원문을 한 메시지로 보냈습니다." in capsys.readouterr().out
     assert config.state_path.read_bytes() == original
 
 
