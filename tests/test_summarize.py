@@ -132,7 +132,7 @@ def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
     elif invalid == "empty": items[0]["text"] = " "
     elif invalid == "english": items[0]["text"] = "Only English sentence"
     elif invalid == "multiline": items[0]["text"] = "산업 수요\n새로운 줄"
-    elif invalid == "long": items[0]["text"] = "가" * 21
+    elif invalid == "long": items[0]["text"] = "가" + "A" * 24
     elif invalid == "wide": items[0]["text"] = "가" * 19
     elif invalid == "duplicate": items[1]["text"] = items[0]["text"]
     elif invalid == "boolean-page": items[0]["pages"] = [True]
@@ -147,19 +147,20 @@ def test_invalid_summary_is_rejected_instead_of_sent(provider, invalid):
         summarize.summarize_pdf(REPORT, PDF, 20)
 
 
-@pytest.mark.parametrize("text", ["가" * 18, "가" + "A" * 19])
+@pytest.mark.parametrize("text", ["가" * 18, "가" + "A" * 20, "가" + "A" * 23])
 def test_compact_summary_preserves_complete_text_at_both_limits(provider, text):
-    _, responses = provider
+    calls, responses = provider
     items = summary_items()
     items[0]["text"] = text
     responses[:] = [Response(data=body(items))]
     lines = summarize.summarize_pdf(REPORT, PDF, 20)
     assert lines[0] == text
     assert len(lines) == 10
+    assert len(calls) == 1
     assert all("…" not in line and "(p." not in line for line in lines)
 
 
-@pytest.mark.parametrize("text", ["가" * 19, "가" + "A" * 20, "수요\u2028개선", "성장\u200b전망", "1. 기판 수요 개선"])
+@pytest.mark.parametrize("text", ["가" * 19, "가" + "A" * 24, "수요\u2028개선", "성장\u200b전망", "1. 기판 수요 개선"])
 def test_compact_summary_does_not_silently_clip_long_or_hidden_line_breaks(text):
     lines = [f"수요 개선 {index}" for index in range(10)]
     lines[0] = text
