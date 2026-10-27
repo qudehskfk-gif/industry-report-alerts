@@ -1,0 +1,100 @@
+name: Verify compact PDF summary message
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-compact-summary.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: industry-report-monitor
+  cancel-in-progress: false
+
+jobs:
+  compact-example:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI }}
+      STATE_PATH: example-state.sqlite3
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read original delivery metadata
+        run: |
+          git fetch --no-tags origin refs/heads/notification-state
+          git show FETCH_HEAD:state.sqlite3 > example-state.sqlite3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Send one PDF with its short summary in the same caption
+        run: |
+          python - <<'PY'
+          import html
+          import re
+          import sqlite3
+          from pathlib import Path
+          from reportbot.classify import classify
+          from reportbot.config import Config
+          from reportbot.http import make_session
+          from reportbot.runner import resolve
+          from reportbot.state import State
+          from reportbot.summarize import summary_text_width, validate_summary_lines
+          from reportbot.telegram import Telegram
+
+          class CheckedTelegram(Telegram):
+              deliveries = 0
+              def call(self, method, payload, *, files=None):
+                  if method == 'sendMessage':
+                      raise RuntimeError('별도 요약 메시지를 전송하려 해서 중단했습니다.')
+                  if method == 'sendDocument':
+                      text = html.unescape(payload.get('caption', ''))
+                      lines = re.findall(r'^\d+\. (.+)$', text, re.MULTILINE)
+                      validate_summary_lines(lines)
+                      if len(payload['caption'].encode('utf-16-le')) // 2 > 1024:
+                          raise RuntimeError('PDF 설명 길이 제한을 초과했습니다.')
+                  result = super().call(method, payload, files=files)
+                  if method == 'sendDocument':
+                      if not result.get('document') or result.get('chat', {}).get('type') not in {'group', 'supergroup'}:
+                          raise RuntimeError('그룹방 PDF 첨부 응답을 확인하지 못했습니다.')
+                      actual_lines = re.findall(r'^\d+\. (.+)$', result.get('caption', ''), re.MULTILINE)
+                      validate_summary_lines(actual_lines)
+                      self.deliveries += 1
+                      print(f'단일 PDF 메시지 발송 완료: 요약 {len(actual_lines)}줄, 최대 {max(map(len, actual_lines))}자, 최대 표시 폭 {max(map(summary_text_width, actual_lines))}칸.', flush=True)
+                  return result
+
+          def main():
+              config = Config.from_env()
+              path = Path(config.state_path).resolve()
+              before = path.read_bytes()
+              with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as database:
+                  row = database.execute("SELECT metadata_json,pdf_hash FROM reports WHERE source='naver' AND source_id='46612' AND outcome='sent' AND date(processed_at,'+9 hours')='2026-10-26'").fetchone()
+              if not row:
+                  raise RuntimeError('기존 발송 자료를 확인하지 못했습니다.')
+              report = State._decode(row[0])
+              telegram = CheckedTelegram(config.token, config.chat_id)
+              if telegram.call('getChat', {'chat_id': config.chat_id}).get('type') not in {'group', 'supergroup'}:
+                  raise RuntimeError('설정된 수신처가 그룹방이 아닙니다.')
+              with make_session() as session:
+                  report = resolve(report, session)
+                  decision = classify(report, session, config.min_pdf_pages)
+              if not decision.accepted or decision.pages != 27 or decision.pdf_hash != row[1]:
+                  raise RuntimeError('기존 PDF 원문과 일치하지 않습니다.')
+              print(f'기존 PDF 원문 검증 완료 ({decision.pages}쪽).', flush=True)
+              telegram.send_report(report, decision)
+              if telegram.deliveries != 1 or path.read_bytes() != before:
+                  raise RuntimeError('단일 전송과 기존 기록 유지 검증에 실패했습니다.')
+              print('별도 텍스트 메시지 없이, 요약 10줄과 PDF를 한 메시지로 발송했습니다.', flush=True)
+
+          try:
+              main()
+          except Exception as error:
+              print(f'짧은 요약 완성본 시험을 완료하지 못했습니다 ({type(error).__name__}).')
+              raise SystemExit(1) from None
+          PY
