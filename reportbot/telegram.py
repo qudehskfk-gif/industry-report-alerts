@@ -244,7 +244,15 @@ class Telegram:
         except Exception as exc:
             # A failed optional summary must never stop or permanently reject
             # the PDF; remote errors may contain credentials or source text.
-            log.warning("리포트 요약을 건너뜁니다 (%s). PDF 원문은 계속 전송합니다.", type(exc).__name__)
+            if isinstance(exc, SummaryError):
+                # SummaryError exposes only bounded, allowlisted diagnostics.
+                # Never log its message or a provider response body.
+                log.warning(
+                    "리포트 요약을 건너뜁니다 (SummaryError; code=%s; HTTP=%s; reason=%s). PDF 원문은 계속 전송합니다.",
+                    exc.code, exc.status_code, exc.reason,
+                )
+            else:
+                log.warning("리포트 요약을 건너뜁니다 (%s). PDF 원문은 계속 전송합니다.", type(exc).__name__)
             notice = "요약 생성에 실패해 PDF 원문만 첨부합니다."
             if _utf16_length(caption + "\n" + notice) <= 1024:
                 caption += "\n" + notice

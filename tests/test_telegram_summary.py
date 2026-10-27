@@ -5,6 +5,7 @@ import pytest
 
 from reportbot.classify import Decision
 from reportbot.models import Report
+from reportbot.summarize import SummaryError
 from reportbot.telegram import Telegram, TelegramError, report_caption, report_summary_caption
 
 
@@ -102,6 +103,30 @@ def test_generation_failure_does_not_drop_pdf_or_expose_exception(delivery, monk
     assert [method for method, payload in calls] == ["sendDocument"]
     assert "요약 생성에 실패해 PDF 원문만 첨부합니다." in calls[0][1]["caption"]
     assert "RuntimeError" in caplog.text
+    for sensitive in [TOKEN, CHAT_ID, "full-sensitive-PDF-text"]:
+        assert sensitive not in caplog.text
+
+
+@pytest.mark.parametrize("code,status,reason", [
+    ("quota_429", 429, None),
+    ("http_503", 503, None),
+    ("validation_budget", None, None),
+    ("transport_error", None, "ReadTimeout"),
+    ("http_400", 400, "API_KEY_INVALID"),
+])
+def test_summary_failure_logs_safe_diagnostics_and_keeps_pdf(delivery, monkeypatch, caplog, code, status, reason):
+    telegram, calls, waits, downloads = delivery
+
+    def fail(*args):
+        raise SummaryError(
+            f"{TOKEN} {CHAT_ID} full-sensitive-PDF-text",
+            code=code, status_code=status, reason=reason,
+        )
+
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", fail)
+    telegram.send_report(report(), DECISION)
+    assert [method for method, payload in calls] == ["sendDocument"]
+    assert f"code={code}; HTTP={status}; reason={reason}" in caplog.text
     for sensitive in [TOKEN, CHAT_ID, "full-sensitive-PDF-text"]:
         assert sensitive not in caplog.text
 
