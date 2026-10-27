@@ -1,5 +1,6 @@
 import html
 import io
+import logging
 import re
 import time
 import unicodedata
@@ -9,6 +10,9 @@ import requests
 from .classify import Decision, MAX_PDF_BYTES
 from .http import make_session
 from .models import Report
+from .summarize import summarize_pdf
+
+log = logging.getLogger(__name__)
 
 
 class TelegramError(RuntimeError):
@@ -94,6 +98,27 @@ def report_error_message(report: Report, reason: str) -> str:
         # Do not corrupt the URL or silently omit the requested report link.
         raise TelegramError("리포트 안내 메시지의 원문 주소가 텔레그램 길이 제한을 초과했습니다.")
     return text + "\n" + link
+
+
+def report_summary_message(report: Report, summary: list[str]) -> str:
+    """Format ten validated summary lines without trusting generated HTML."""
+    if not isinstance(summary, list) or len(summary) != 10 or any(
+        not isinstance(line, str) or not line.strip() or "\n" in line or "\r" in line
+        for line in summary
+    ):
+        raise TelegramError("리포트 요약은 비어 있지 않은 열 줄이어야 합니다.")
+    lines = [
+        "📝 <b>AI 리포트 10줄 요약</b>",
+        f"<b>{_escaped_trim(report.title, 350)}</b>",
+        f"{_escaped_trim(report.broker, 90)} · {report.published_date.isoformat()}",
+    ]
+    if report.sector:
+        lines.append(f"섹터: {_escaped_trim(report.sector, 80)}")
+    lines += [f"{index}. {_escaped_trim(line.strip(), 260)}" for index, line in enumerate(summary, 1)]
+    message = "\n".join(lines)
+    if _utf16_length(message) > 4096:
+        raise TelegramError("리포트 요약이 텔레그램 길이 제한을 초과했습니다.")
+    return message
 
 
 def download_pdf(url: str) -> bytes:
@@ -183,9 +208,22 @@ class Telegram:
         if not report.pdf_url:
             raise TelegramError("PDF 원문 주소가 아직 없어 첨부하지 않았습니다.")
         data = download_pdf(report.pdf_url)
+        caption = report_caption(report, decision)
+        try:
+            summary = summarize_pdf(report, data, decision.pages)
+            if summary is not None:
+                self.send(report_summary_message(report, summary))
+                time.sleep(1.1)
+        except Exception as exc:
+            # A failed optional summary must never stop or permanently reject
+            # the PDF; remote errors may contain credentials or source text.
+            log.warning("리포트 요약을 건너뜁니다 (%s). PDF 원문은 계속 전송합니다.", type(exc).__name__)
+            notice = "요약 생성에 실패해 PDF 원문만 첨부합니다."
+            if _utf16_length(caption + "\n" + notice) <= 1024:
+                caption += "\n" + notice
         with io.BytesIO(data) as document:
             return self.call("sendDocument", {
                 "chat_id": self.chat_id,
-                "caption": report_caption(report, decision),
+                "caption": caption,
                 "parse_mode": "HTML",
             }, files={"document": (pdf_filename(report), document, "application/pdf")})
