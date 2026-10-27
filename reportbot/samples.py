@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 SOURCES = {"hankyung": hankyung.fetch_reports, "naver": naver.fetch_reports}
 
 
-def select_reports(candidates: list[Report], session, *, count: int = 5, min_pages: int = 20) -> list[tuple[Report, Decision]]:
+def select_reports(candidates: list[Report], session, *, count: int = 5, min_pages: int = 10) -> list[tuple[Report, Decision]]:
     if count < 1:
         raise ValueError("count must be positive")
     groups = defaultdict(list)

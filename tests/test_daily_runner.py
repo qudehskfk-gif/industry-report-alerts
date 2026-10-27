@@ -176,6 +176,41 @@ def test_daily_delivery_has_no_five_report_limit(runner, monkeypatch, config):
     assert len(sent) == 8
 
 
+def test_ten_page_policy_rechecks_previous_length_rejections_without_resending_deliveries(runner, monkeypatch, config):
+    config = replace(config, min_pdf_pages=10)
+    outlook = report(source_id="100", title="소비 여력은 여전히 크다")
+    delivered = report(source_id="101", title="이미 보낸 산업 보고서")
+    short = report(source_id="102", title="아홉 쪽 산업 보고서")
+    state = State(config.state_path)
+    state.record(outlook, "rejected: 심층 표시 없음·17쪽", "outlook-pdf")
+    state.record(delivered, "sent", "delivered-pdf")
+    state.record(short, "rejected: 심층 표시 없음·9쪽", "short-pdf")
+    original_time = state.db.execute(
+        "SELECT processed_at FROM reports WHERE source_id='101'"
+    ).fetchone()
+    state.close()
+    monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *a, **kw: [outlook, delivered, short]})
+    inspected = []
+
+    def inspect(item, session, min_pages):
+        assert min_pages == 10
+        inspected.append(item)
+        return Decision(True, "산업 리포트 17쪽 (분량 기준)", 17, "outlook-pdf")
+
+    monkeypatch.setattr(runner, "classify", inspect)
+    sent = capture_sends(monkeypatch)
+    assert runner.check(config) == 0
+    assert sent == [outlook]
+    assert inspected == [outlook]
+    assert runner.check(config) == 0
+    assert sent == [outlook]
+    state = State(config.state_path)
+    assert state.outcome(outlook) == "sent"
+    assert state.outcome(short) == "rejected: 심층 표시 없음·9쪽"
+    assert state.db.execute("SELECT processed_at FROM reports WHERE source_id='101'").fetchone() == original_time
+    state.close()
+
+
 def test_report_error_notice_allows_success_and_stops_retry_without_faking_pdf_delivery(runner, monkeypatch, config, notices):
     failed = report(source_id="100")
     healthy = report(source_id="101")

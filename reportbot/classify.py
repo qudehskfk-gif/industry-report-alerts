@@ -7,7 +7,6 @@ from pypdf import PdfReader
 
 from .models import Report
 
-DEPTH = re.compile(r"in[\s‐‑–—_-]*depth|심층\s*(?:분석|리포트|보고서)|산업\s*대해부", re.I)
 PERIODIC = re.compile(
     r"\b(?:daily|weekly|monthly|morning|brief|briefing|snapshot|pulse)\b|"
     r"데일리|위클리|먼슬리|모닝|브리프|브리핑|주간|일간|월간|일일|주보|월보|"
@@ -60,19 +59,15 @@ def inspect_pdf(session, url: str) -> tuple[int, str, str]:
     return pages, front, hashlib.sha256(data).hexdigest()
 
 
-def classify(report: Report, session, min_pages: int = 20) -> Decision:
+def classify(report: Report, session, min_pages: int = 10) -> Decision:
     rejection = title_rejection(report)
     if rejection:
         return Decision(False, rejection)
-    explicit = report.explicit_in_depth or bool(DEPTH.search(report.title))
     if not report.pdf_url:
-        # An explicit label is enough even when the source supplies only a detail link.
-        return Decision(explicit, "명시된 심층 리포트" if explicit else "심층 표시·PDF 없음")
+        return Decision(False, "PDF 없음·분량 확인 불가")
     pages, front, digest = inspect_pdf(session, report.pdf_url)
-    if explicit or DEPTH.search(front[:12000]):
-        return Decision(True, "In-depth·심층 표시", pages, digest)
     if re.search(r"\b(?:daily|weekly|monthly)\b|(?:주간|월간|일간)\s*(?:리뷰|동향|보고|분석)", front[:800], re.I):
         return Decision(False, "표지의 정기 동향 자료 표시", pages, digest)
     if pages >= min_pages:
         return Decision(True, f"산업 리포트 {pages}쪽 (분량 기준)", pages, digest)
-    return Decision(False, f"심층 표시 없음·{pages}쪽", pages, digest)
+    return Decision(False, f"최소 {min_pages}쪽 미만·{pages}쪽", pages, digest)

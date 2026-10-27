@@ -25,7 +25,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI }}
       STATE_PATH: state-store/state.sqlite3
-      MIN_PDF_PAGES: '20'
+      MIN_PDF_PAGES: '10'
       REPLAY_DATE: ${{ inputs.report_date }}
       PYTHONUNBUFFERED: '1'
     steps:

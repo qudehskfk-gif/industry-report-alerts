@@ -192,17 +192,42 @@ def test_periodic_and_single_company_titles_rejected(title):
     assert title_rejection(report(title=title))
 
 
-@pytest.mark.parametrize("pages,front,expected", [(19, "산업 분석", False), (20, "산업 분석", True), (7, "Industry In-depth", True)])
-def test_depth_label_and_page_threshold(monkeypatch, pages, front, expected):
+@pytest.mark.parametrize("pages,front,expected", [
+    (9, "산업 분석", False), (10, "산업 분석", True),
+    (19, "산업 분석", True), (20, "산업 분석", True),
+    (7, "Industry In-depth", False), (10, "Industry In-depth", True),
+])
+def test_page_threshold_does_not_require_or_bypass_depth_labels(monkeypatch, pages, front, expected):
     monkeypatch.setattr("reportbot.classify.inspect_pdf", lambda *a: (pages, front, "hash"))
-    result = classify(report(), object(), 20)
+    result = classify(report(), object())
     assert result.accepted is expected
     assert result.pages == pages
     assert result.pdf_hash == "hash"
 
 
-def test_explicit_depth_without_pdf_is_accepted():
-    assert classify(report(title="[In-depth] 반도체 산업", pdf_url=None), object()).accepted
+@pytest.mark.parametrize("pages,expected", [(19, False), (20, True)])
+def test_custom_page_threshold_is_still_honored(monkeypatch, pages, expected):
+    monkeypatch.setattr("reportbot.classify.inspect_pdf", lambda *a: (pages, "산업 분석", "hash"))
+    assert classify(report(), object(), min_pages=20).accepted is expected
+
+
+@pytest.mark.parametrize("title,explicit", [
+    ("[In-depth] 반도체 산업", False), ("심층 산업 분석", True),
+])
+def test_title_or_source_depth_label_does_not_admit_a_short_pdf(monkeypatch, title, explicit):
+    monkeypatch.setattr("reportbot.classify.inspect_pdf", lambda *a: (7, "산업 분석", "hash"))
+    result = classify(report(title=title, explicit_in_depth=explicit), object())
+    assert not result.accepted
+    assert result.reason == "최소 10쪽 미만·7쪽"
+
+
+def test_depth_label_does_not_override_a_periodic_cover(monkeypatch):
+    monkeypatch.setattr("reportbot.classify.inspect_pdf", lambda *a: (40, "Industry In-depth\nWeekly", "hash"))
+    assert not classify(report(title="[In-depth] 반도체 산업", explicit_in_depth=True), object()).accepted
+
+
+def test_pdf_is_required_even_with_an_explicit_depth_label():
+    assert not classify(report(title="[In-depth] 반도체 산업", pdf_url=None), object()).accepted
     assert not classify(report(pdf_url=None), object()).accepted
 
 

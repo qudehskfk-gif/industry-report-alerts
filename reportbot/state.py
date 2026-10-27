@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import asdict, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .models import Report
 
@@ -20,6 +21,10 @@ _SUMMARY_ERROR_CODES = frozenset({
     "validation_pages", "validation_budget", "caption_error", "telegram_error",
     "download_error", "pdf_hash_mismatch", "summary_disabled",
 })
+_PAGE_ONLY_REJECTION = re.compile(
+    r"rejected: (?:심층 표시 없음|최소 [1-9]\d*쪽 미만)·([1-9]\d*)쪽"
+)
+_PAGE_THRESHOLD_POLICY = "page_threshold_recheck_v1"
 
 
 def summary_destination_key(token: str, chat_id: str) -> str:
@@ -212,6 +217,60 @@ class State:
             ORDER BY processed_at, source, source_id
         """).fetchall()
         return [self._decode(row[0]) for row in rows]
+
+    def requeue_page_threshold(self, min_pages: int, *, lookback_days: int = 45,
+                              today: date | None = None) -> int:
+        """Reconsider recent, unsent PDFs rejected only for their page count.
+
+        Keep the active policy for inspection, but do not use it to suppress
+        later metadata hydration after a source outage. Changing an eligible
+        row to pending makes repeated calls naturally idempotent. Sent,
+        historical, periodic, company and PDF-error records are never reopened.
+        """
+        if type(min_pages) is not int or min_pages < 1:
+            raise ValueError("Minimum PDF pages must be positive")
+        if type(lookback_days) is not int or lookback_days < 1:
+            raise ValueError("Report lookback days must be positive")
+        if today is None:
+            today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        if type(today) is not date:
+            raise ValueError("A report recheck date is required")
+        cutoff = today - timedelta(days=lookback_days)
+        policy = json.dumps({"min_pages": min_pages, "lookback_days": lookback_days},
+                            sort_keys=True)
+        previous_policy = self.get_setting(_PAGE_THRESHOLD_POLICY)
+        candidates = []
+        for source, source_id, outcome, raw in self.db.execute("""
+            SELECT source,source_id,outcome,metadata_json FROM reports
+            WHERE outcome LIKE 'rejected: %쪽' AND metadata_json IS NOT NULL
+        """).fetchall():
+            match = _PAGE_ONLY_REJECTION.fullmatch(outcome)
+            if not match or int(match[1]) < min_pages:
+                continue
+            try:
+                report = self._decode(raw)
+            except (ValueError, TypeError, KeyError):
+                # Incomplete legacy metadata can be hydrated by a later scan.
+                continue
+            if (report.source, report.source_id) != (source, source_id):
+                continue
+            if report.category != "industry" or not cutoff <= report.published_date <= today:
+                continue
+            candidates.append((source, source_id, outcome))
+        changed = 0
+        with self.db:
+            for source, source_id, outcome in candidates:
+                result = self.db.execute("""
+                    UPDATE reports SET outcome='pending'
+                    WHERE source=? AND source_id=? AND outcome=?
+                """, (source, source_id, outcome))
+                changed += result.rowcount
+            if previous_policy != policy:
+                self.db.execute("""
+                    INSERT INTO state_meta(name,value) VALUES (?,?)
+                    ON CONFLICT(name) DO UPDATE SET value=excluded.value
+                """, (_PAGE_THRESHOLD_POLICY, policy))
+        return changed
 
     def baseline(self, source: str, reports: list[Report]):
         with self.db:

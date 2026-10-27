@@ -30,7 +30,7 @@ class Config:
             Path(os.getenv("STATE_PATH", "data/state.sqlite3")),
             os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-            positive_int("MIN_PDF_PAGES", 20),
+            positive_int("MIN_PDF_PAGES", 10),
             positive_int("MAX_LIST_PAGES", 100),
             positive_int("POLL_SECONDS", 86400),
             positive_int("MAX_REPORT_AGE_DAYS", 14),

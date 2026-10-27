@@ -115,6 +115,12 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     try:
         with make_session() as session:
             discovered, errors = discover(config, session, state)
+            if state is not None:
+                reopened = state.requeue_page_threshold(
+                    config.min_pdf_pages, lookback_days=config.scan_lookback_days,
+                )
+                if reopened:
+                    log.info("최소 쪽수 기준 변경으로 기존 제외 자료 %d건 재검사 예약", reopened)
             if telegram is not None:
                 # Process old jobs before recording new failed summaries, so an
                 # exhausted provider is not immediately retried in the same run.
