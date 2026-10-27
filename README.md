@@ -69,7 +69,7 @@ GitHub 예약 실행은 지연되거나 건너뛰어질 수 있어 17:00 정각 
 3. [GitHub 새 Secret 등록 화면](https://github.com/qudehskfk-gif/industry-report-alerts/settings/secrets/actions/new)을 엽니다. **Name**에 `GEMINI_API_KEY`, **Secret**에 복사한 API 키를 붙여 넣고 **Add secret**을 누릅니다. 기존 `TELEGRAM_BOT_TOKEN`과 `TELEGRAM_CHAT_ID`는 그대로 둡니다.
 4. GitHub **Actions → Test report summary → Run workflow**를 실행합니다. 가장 최근에 발송한 리포트 한 건의 요약만 현재 수신처로 보내므로 새 자료가 없어도 연결을 시험할 수 있습니다. PDF를 다시 보내거나 기존 발송 기록을 바꾸지 않습니다.
 
-봇은 첨부할 **PDF 전체를 Google Gemini API로 전송**해 본문·표·차트를 요약합니다. 기본 모델은 `gemini-3.8-flash`입니다. API 키나 요약 본문을 공개 알림 DB에 저장하지 않습니다.
+봇은 첨부할 **PDF 전체를 Google Gemini API로 전송**해 본문·표·차트를 요약합니다. 기본 모델은 `gemini-3.1-flash-lite`입니다. API 키나 요약 본문을 공개 알림 DB에 저장하지 않습니다.
 
 키가 없으면 PDF만 보내며, 요약 생성·검증·전송이 실패하거나 무료 한도에 도달해도 같은 실행에서 PDF 발송을 계속합니다. 한도 오류가 나면 해당 실행의 남은 AI 호출을 중단합니다. 유료 서비스로 자동 전환하지 않습니다. **무료 사용 여부는 키가 속한 Google 프로젝트의 결제 설정에 달려 있으며, 코드가 유료 프로젝트의 과금을 막지는 못합니다.** 무료 한도는 [Google 공식 요금 안내](https://ai.google.dev/gemini-api/docs/pricing)에서 확인할 수 있습니다.
 
@@ -143,7 +143,7 @@ GitHub에서는 워크플로 `env`를, 로컬에서는 `.env`를 바꿉니다.
 | `POLL_SECONDS` | `86400` | 선택형 로컬 daemon의 반복 간격; GitHub 17시 예약과는 별도 |
 | `STATE_PATH` | `data/state.sqlite3` | 발송·미처리 대기열 기록 파일 |
 | `GEMINI_API_KEY` | 없음 | 선택 사항. GitHub Secret으로 등록하면 PDF 전송 전 AI 요약 활성화 |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | 요약용 Gemini 모델 |
+| `GEMINI_MODEL` | `gemini-3.1-flash-lite` | 요약용 Gemini 모델 |
 | `SUMMARY_MODE` | `auto` | 키가 있으면 요약. `off`로 설정하면 PDF만 발송 |
 
 발간일 나이를 기준으로 미처리 자료를 버리는 설정은 사용하지 않습니다. 대기열은 탐색 기간이 지나도 유지되지만, 첫 PDF 오류 뒤 링크 안내가 끝난 자료는 자동 처리 대상에서 제외합니다. GitHub 실행 시점은 `POLL_SECONDS`가 아니라 `cron`으로 정합니다.

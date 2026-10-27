@@ -108,7 +108,7 @@ def check_provider_connection() -> None:
                            code="transport_error", reason=_transport_reason(error)) from None
 
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 _CACHE: OrderedDict[tuple, tuple[str, ...]] = OrderedDict()
 _QUOTA_BLOCKED: set[str] = set()
 

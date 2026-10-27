@@ -76,7 +76,7 @@ def test_summary_sends_whole_pdf_and_header_key_then_validates_ten_grounded_line
     assert lines[0] == "산업 수요 전망의 핵심 근거 1 (p.1, 3)"
     assert "Internal reasoning" not in "\n".join(lines)
     [(url, options)] = calls
-    assert url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+    assert url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
     assert API_KEY not in url
     headers = {key.lower(): value for key, value in options["headers"].items()}
     assert headers["x-goog-api-key"] == API_KEY
@@ -310,7 +310,7 @@ def metadata_provider(monkeypatch):
 def test_connection_probe_checks_model_with_header_key_and_no_generation(metadata_provider):
     calls, _ = metadata_provider
     assert summarize.check_provider_connection() is None
-    assert calls == [("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash", {
+    assert calls == [("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite", {
         "headers": {"x-goog-api-key": API_KEY}, "timeout": (10, 15), "allow_redirects": False,
     })]
 
