@@ -196,8 +196,8 @@ def test_html_entity_expansion_does_not_discard_a_summary_that_fits():
 
 @pytest.mark.parametrize("units", [1024, 1025])
 def test_caption_limit_counts_visible_utf16_and_preserves_whole_text(monkeypatch, units):
-    # Exercise the formatter's final Telegram guard independently of the
-    # provider's smaller budget reserved for report metadata.
+    # Exercise the formatter's final Telegram guard, including supplementary
+    # Unicode characters which consume two UTF-16 units.
     summary = section_summary(3, 3)
     visible_body = "\n\n".join(
         "\n".join([f"{index}. {section['heading']}", *[f"• {point}" for point in section['points']]])
@@ -232,6 +232,37 @@ def test_large_valid_summary_keeps_all_points_and_reduces_metadata_first():
     caption = report_summary_caption(item, DECISION, summary)
     assert visible_units(caption) <= 1024
     assert caption.count("\n• ") == 15
+    for section in summary:
+        assert section["heading"] in caption
+        for point in section["points"]:
+            assert point in caption
+
+
+def test_927_unit_summary_keeps_full_content_and_compact_identification(delivery, monkeypatch):
+    from reportbot.summarize import summary_body_text
+
+    telegram, calls, waits, downloads = delivery
+    summary = section_summary(5, 3)
+    for index, section in enumerate(summary, 1):
+        section["heading"] = f"반도체 산업 구조 변화의 원인과 전망을 설명하는 주제 {index}"
+        section["points"] = [
+            f"AI 수요 확대가 고부가 제품 공급과 기업 수익성에 미치는 영향을 분석 {index}-{point}"
+            for point in range(1, 4)
+        ]
+    # The earlier 900-unit provider limit discarded a real 927-unit draft.
+    # Preserve a complete final explanation while reproducing that size.
+    summary[-1]["points"][-1] += " 또한 고객 주문과 신규 증설이 수익성 개선으로 이어지는 시점까지 함께 살펴보아야 한다는 점이 핵심입니다."
+    assert len(summary_body_text(summary).encode("utf-16-le")) // 2 == 927
+    item = report(title="2027년 산업 전망과 투자 기회를 종합적으로 분석하는 상세 보고서 " * 4,
+                  broker="산업분석전문리서치증권회사", sector="반도체패키지기판공급망산업전반")
+    monkeypatch.setattr("reportbot.telegram.summarize_pdf", lambda *args: summary)
+    telegram.send_report(item, DECISION)
+    assert [method for method, payload in calls] == ["sendDocument"]
+    caption = calls[0][1]["caption"]
+    assert visible_units(caption) <= 1024
+    assert item.broker in caption and item.published_date.isoformat() in caption
+    assert item.sector in caption and "30쪽" in caption
+    assert "요약 생성에 실패" not in caption
     for section in summary:
         assert section["heading"] in caption
         for point in section["points"]:

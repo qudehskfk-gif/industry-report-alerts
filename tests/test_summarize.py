@@ -181,7 +181,7 @@ def test_invalid_sections_are_rejected_without_cutting_their_contents(provider, 
 
 def test_total_body_budget_rejects_oversized_sections_without_truncation():
     sections = normalized(explanatory_items(5, 5))
-    assert len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2 > 900
+    assert len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2 > 1024
     with pytest.raises(summarize.SummaryError) as error:
         summarize.validate_summary_sections(sections)
     assert error.value.code == "validation_budget"
@@ -203,6 +203,32 @@ def test_meaningful_five_theme_summary_over_old_budget_is_accepted(provider):
     responses[:] = [Response(data=body(items))]
     assert summarize.summarize_pdf(REPORT, PDF, 20) == sections
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("units", [927, 1024])
+def test_summary_that_fits_the_real_telegram_limit_is_accepted_without_rewrite(provider, units):
+    calls, responses = provider
+    items = explanatory_items()
+    sections = normalized(items)
+    used = len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2
+    # Reproduce the measured 927-unit incident without publishing its content.
+    items[-1]["points"][-1]["text"] += "가" * (units - used)
+    sections = normalized(items)
+    assert len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2 == units
+    responses[:] = [Response(data=body(items))]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == sections
+    assert len(calls) == 1
+
+
+def test_only_content_over_the_real_telegram_limit_requires_rewrite(provider, caplog):
+    calls, responses = provider
+    items = explanatory_items()
+    used = len(summarize.summary_body_text(normalized(items)).encode("utf-16-le")) // 2
+    items[-1]["points"][-1]["text"] += "가" * (1025 - used)
+    responses[:] = [Response(data=body(items)), Response()]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == normalized()
+    assert len(calls) == 2
+    assert "표시 길이=1025; 상한=1024" in caplog.text
 
 
 def test_headings_do_not_have_an_artificial_eighteen_character_limit():
@@ -258,7 +284,7 @@ def test_budget_rewrite_logs_only_lengths_and_codes(provider, caplog):
     responses[:] = [Response(data=body(draft)), Response()]
     summarize.summarize_pdf(REPORT, PDF, 20)
     assert "code=validation_budget" in caplog.text
-    assert "상한=900" in caplog.text
+    assert "상한=1024" in caplog.text
     assert draft[0]["points"][0]["text"] not in caplog.text
     assert API_KEY not in caplog.text
 

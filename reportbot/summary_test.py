@@ -36,6 +36,7 @@ def send_summary_test(config: Config):
     if summary is None:
         raise ValueError("GEMINI_API_KEY Secret을 등록해야 요약을 시험할 수 있습니다.")
     caption = report_summary_caption(report, Decision(True, f"산업 리포트 {pages}쪽", pages), summary)
+    print(f"요약 검증 완료 (큰 제목 {len(summary)}개, 설명 {sum(len(section['points']) for section in summary)}줄).", flush=True)
     with io.BytesIO(data) as document:
         result = Telegram(config.token, config.chat_id).call("sendDocument", {
             "chat_id": config.chat_id, "caption": caption, "parse_mode": "HTML",

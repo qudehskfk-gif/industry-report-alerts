@@ -150,9 +150,24 @@ def report_summary_caption(report: Report, decision: Decision, summary: list[dic
             " · ".join(details),
         ])
 
+    def compact_metadata(*, include_title):
+        # Keep identification and sector details when the summary needs most
+        # of the caption. The document's filename also carries its full title.
+        lines = [f"{_escaped_trim(report.broker, 25)} · {report.published_date.isoformat()}"]
+        details = []
+        if report.sector:
+            details.append(f"섹터: {_escaped_trim(report.sector, 25)}")
+        details.append(_escaped_trim(pages, 20))
+        lines.append(" · ".join(details))
+        if include_title:
+            lines.insert(0, f"📚 <b>{_escaped_trim(report.title, 20)}</b>")
+        return "\n".join(lines)
+
     # Preserve every heading and explanation. Reduce optional metadata first.
     candidates = [metadata(120, 45, 40, 24), metadata(60, 25, 22, 18),
-                  metadata(30, 16, 12, 12), f"📚 <b>{_escaped_trim(report.title, 24)}</b>", ""]
+                  compact_metadata(include_title=True), compact_metadata(include_title=False),
+                  metadata(30, 16, 12, 12),
+                  f"📚 <b>{_escaped_trim(report.title, 24)}</b>", ""]
     caption = body
     for header in candidates:
         candidate = header + "\n\n" + body if header else body
