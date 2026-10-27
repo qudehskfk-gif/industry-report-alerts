@@ -1,6 +1,9 @@
 import logging
 import os
+from collections import Counter
 from dataclasses import replace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .classify import Decision, classify, inspect_pdf, title_rejection
 from .config import Config
@@ -101,6 +104,7 @@ def _summary_receipt(result, config):
 
 
 def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) -> int:
+    started_at = datetime.now(ZoneInfo("Asia/Seoul"))
     preview = dry_run or preview_only
     telegram = None if preview else Telegram(config.token, config.chat_id)
     if not preview and not config.chat_id:
@@ -111,7 +115,11 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     preview_titles = set()
     preview_hashes = set()
     report_failures = []
+    rejected_reports = []
+    duplicate_reports = []
+    reviewed = 0
     notification_errors = 0
+    run_summary_errors = 0
     try:
         with make_session() as session:
             discovered, errors = discover(config, session, state)
@@ -134,15 +142,18 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     reason = state.get_setting(f"report_error_reason:{report.source}:{report.source_id}", "PDF 첨부를 완료하지 못했습니다.")
                     report_failures.append((report, reason))
                     continue
+                reviewed += 1
                 rejection = title_rejection(report)
                 if rejection:
                     if state is not None:
                         state.record(report, "rejected: " + rejection)
                     totals["rejected"] += 1
+                    rejected_reports.append((report, rejection))
                     continue
                 if state is not None and state.duplicate(report):
                     state.record(report, "duplicate")
                     totals["duplicates"] += 1
+                    duplicate_reports.append((report, "이미 발송한 제목 또는 동일 PDF"))
                     continue
                 failure_reason = "PDF 원문 주소를 확인하지 못했습니다."
                 try:
@@ -155,15 +166,18 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         if state is not None:
                             state.record(report, "rejected: " + decision.reason, decision.pdf_hash)
                         totals["rejected"] += 1
+                        rejected_reports.append((report, decision.reason))
                         continue
                     if state is not None and state.duplicate(report, decision.pdf_hash):
                         state.record(report, "duplicate", decision.pdf_hash)
                         totals["duplicates"] += 1
+                        duplicate_reports.append((report, "이미 발송한 제목 또는 동일 PDF"))
                         continue
                     fingerprint = title_fingerprint(report)
                     if preview:
                         if fingerprint in preview_titles or (decision.pdf_hash and decision.pdf_hash in preview_hashes):
                             totals["duplicates"] += 1
+                            duplicate_reports.append((report, "이번 미리보기에서 확인한 중복 제목 또는 동일 PDF"))
                             continue
                         preview_titles.add(fingerprint)
                         if decision.pdf_hash:
@@ -185,6 +199,7 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     if state is not None:
                         state.record(report, "rejected: 발행사에서 확인된 개별 기업 리포트")
                     totals["rejected"] += 1
+                    rejected_reports.append((report, "발행사에서 확인된 개별 기업 리포트"))
                     log.info("개별 기업 자료 제외: %s/%s | %s", report.source, report.source_id, report.title)
                 except Exception as exc:
                     if state is not None:
@@ -210,10 +225,30 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         log.error("%s/%s 오류 링크 안내 실패 (%s)", report.source, report.source_id, type(exc).__name__)
             if state is not None:
                 totals["pending"] = len(state.pending())
-            log.info("결과: %s, 수집오류=%d, 리포트오류=%d, 오류안내실패=%d, PDF발송=%s", totals, errors, len(report_failures), notification_errors, not preview)
+            if telegram is not None:
+                try:
+                    telegram.send_run_summary({
+                        "started_at": started_at,
+                        "lookback_days": config.scan_lookback_days,
+                        "source_counts": dict(Counter(report.source for report in discovered)),
+                        "source_errors": errors,
+                        "reviewed": reviewed,
+                        "totals": dict(totals),
+                        "rejected": list(rejected_reports),
+                        "duplicates": list(duplicate_reports),
+                        "errors": list(report_failures),
+                    })
+                    log.info("실행 결과 안내 전송 완료: 검토=%d, PDF발송=%d, 조건제외=%d, 중복제외=%d",
+                             reviewed, totals["sent"], totals["rejected"], totals["duplicates"])
+                except Exception as exc:
+                    # Summary delivery is independent of PDF bookkeeping. A
+                    # failed footer must never cause an uploaded PDF to resend.
+                    run_summary_errors += 1
+                    log.error("실행 결과 안내 전송 실패 (%s)", type(exc).__name__)
+            log.info("결과: %s, 수집오류=%d, 리포트오류=%d, 오류안내실패=%d, 실행요약실패=%d, PDF발송=%s", totals, errors, len(report_failures), notification_errors, run_summary_errors, not preview)
             # A report error handled with a delivered link is a completed run.
             # Collection/notification failures still need operator attention.
-            return 1 if errors or notification_errors else 0
+            return 1 if errors or notification_errors or run_summary_errors else 0
     finally:
         if state is not None:
             state.close()

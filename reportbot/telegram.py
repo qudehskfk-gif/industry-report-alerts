@@ -278,6 +278,23 @@ class Telegram:
     def send_report_error(self, report: Report, reason: str):
         return self.send(report_error_message(report, reason))
 
+    def send_run_summary(self, data: dict):
+        """Send the completed run's counts and complete exclusion list."""
+        from .run_summary import format_run_summary
+
+        messages = format_run_summary(data)
+        if not messages:
+            raise TelegramError("실행 결과 메시지를 만들지 못했습니다.")
+        results = []
+        recent_upload = data.get("totals", {}).get("sent", 0) or data.get("totals", {}).get("linked", 0)
+        for index, message in enumerate(messages):
+            # A group permits about twenty bot messages per minute. Avoid a
+            # footer burst after PDFs or when the exclusion list spans pages.
+            if index or recent_upload:
+                time.sleep(3.1)
+            results.append(self.send(message))
+        return results
+
     def send_report(self, report: Report, decision: Decision):
         if not self.chat_id:
             raise TelegramError("TELEGRAM_CHAT_ID가 필요합니다.")

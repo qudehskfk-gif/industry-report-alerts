@@ -41,6 +41,9 @@ def runner(monkeypatch, notices):
 
     monkeypatch.setattr(runner, "make_session", lambda: nullcontext(object()))
     monkeypatch.setattr(runner, "classify", lambda r, *a: Decision(True, "산업 리포트 25쪽", 25, f"{r.source}:{r.source_id}"))
+    # Keep this suite focused on PDF/notice delivery without outbound footer
+    # requests. Dedicated execution-summary tests verify those messages.
+    monkeypatch.setattr(Telegram, "send_run_summary", lambda self, data: None, raising=False)
     return runner
 
 

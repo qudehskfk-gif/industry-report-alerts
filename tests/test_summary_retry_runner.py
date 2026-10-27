@@ -27,7 +27,7 @@ def recovery(tmp_path, monkeypatch):
     controls = SimpleNamespace(
         delivery={"message_id": 71, "_reportbot_summary_status": "pending",
                   "_reportbot_summary_error": "http_503"},
-        edit_error=None, inspection_hash=DIGEST,
+        edit_error=None, inspection_hash=DIGEST, run_summaries=[],
     )
 
     class Telegram:
@@ -47,6 +47,9 @@ def recovery(tmp_path, monkeypatch):
 
         def send_report_error(self, *args):
             pytest.fail("Summary failures must never create PDF-error notices")
+
+        def send_run_summary(self, data):
+            controls.run_summaries.append(data)
 
     def inspect(*args):
         events.append(("inspect",))

@@ -33,6 +33,9 @@ def runner(monkeypatch):
     from reportbot import runner
 
     monkeypatch.setattr(runner, "make_session", lambda: nullcontext(object()))
+    # These tests exercise report delivery; completion notices are checked in
+    # the execution-summary tests and must not make real Telegram requests.
+    monkeypatch.setattr(Telegram, "send_run_summary", lambda self, data: None, raising=False)
     return runner
 
 
