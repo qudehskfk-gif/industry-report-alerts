@@ -1,4 +1,5 @@
 import html
+from html.parser import HTMLParser
 import io
 import logging
 import re
@@ -21,6 +22,26 @@ class TelegramError(RuntimeError):
 
 def _utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le", errors="ignore")) // 2
+
+
+class _CaptionText(HTMLParser):
+    """Collect the visible text of our fixed, escaped Telegram HTML markup."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def _caption_utf16_length(caption: str) -> int:
+    # Telegram's caption limit applies after entity parsing. Formatting tags,
+    # escaped entity spellings and a link's href do not consume visible space.
+    parser = _CaptionText()
+    parser.feed(caption)
+    parser.close()
+    return _utf16_length("".join(parser.parts))
 
 
 def _escaped_trim(text: str, limit: int) -> str:
@@ -113,7 +134,7 @@ def report_summary_caption(report: Report, decision: Decision, summary: list[dic
         body_lines.append(f"<b>{index}. {html.escape(section['heading'], quote=False)}</b>")
         body_lines.extend(f"• {html.escape(point, quote=False)}" for point in section["points"])
     body = "\n".join(body_lines)
-    if _utf16_length(body) > 1024:
+    if _caption_utf16_length(body) > 1024:
         raise TelegramError("리포트 요약이 PDF 설명 길이 제한을 초과했습니다.")
 
     source = {"hankyung": "한경 컨센서스", "naver": "네이버 금융"}.get(report.source, report.source)
@@ -135,11 +156,11 @@ def report_summary_caption(report: Report, decision: Decision, summary: list[dic
     caption = body
     for header in candidates:
         candidate = header + "\n\n" + body if header else body
-        if _utf16_length(candidate) <= 1024:
+        if _caption_utf16_length(candidate) <= 1024:
             caption = candidate
             break
     link = f'<a href="{html.escape(report.detail_url, quote=True)}">원문 페이지</a>'
-    if _utf16_length(caption + "\n" + link) <= 1024:
+    if _caption_utf16_length(caption + "\n" + link) <= 1024:
         caption += "\n" + link
     return caption
 

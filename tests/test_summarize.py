@@ -22,6 +22,13 @@ def summary_items(count=5, points=3):
     ]} for section in range(1, count + 1)]
 
 
+def explanatory_items(count=5, points=3):
+    return [{"heading": f"산업 핵심 주제 {section}", "points": [
+        {"text": f"고부가 제품 수요가 증가하며 설비 투자와 생산 확대를 이끌 것으로 전망 {section}-{point}", "pages": [1, 3]}
+        for point in range(1, points + 1)
+    ]} for section in range(1, count + 1)]
+
+
 def normalized(items=None):
     items = summary_items() if items is None else items
     return [{"heading": section["heading"], "points": [point["text"] for point in section["points"]]}
@@ -138,8 +145,7 @@ def test_nested_cache_returns_deep_copies_and_is_scoped_to_key_and_model(provide
 @pytest.mark.parametrize("invalid,code", [
     ("count", "validation_items"), ("points-count", "validation_items"),
     ("empty", "validation_text"), ("english", "validation_text"),
-    ("multiline", "validation_text"), ("long", "validation_text"),
-    ("wide", "validation_text"), ("heading", "validation_text"),
+    ("multiline", "validation_text"),
     ("duplicate", "validation_duplicate"), ("duplicate-heading", "validation_duplicate"),
     ("boolean-page", "validation_pages"), ("zero-page", "validation_pages"),
     ("outside-page", "validation_pages"), ("no-page", "validation_pages"),
@@ -155,9 +161,6 @@ def test_invalid_sections_are_rejected_without_cutting_their_contents(provider, 
     elif invalid == "empty": point["text"] = " "
     elif invalid == "english": point["text"] = "Only English sentence"
     elif invalid == "multiline": point["text"] = "수요 증가\n생산 확대"
-    elif invalid == "long": point["text"] = "가" + "A" * 42
-    elif invalid == "wide": point["text"] = "가" * 39
-    elif invalid == "heading": items[0]["heading"] = "가" * 19
     elif invalid == "duplicate": items[1]["points"][0]["text"] = point["text"]
     elif invalid == "duplicate-heading": items[1]["heading"] = items[0]["heading"]
     elif invalid == "boolean-page": point["pages"] = [True]
@@ -177,18 +180,48 @@ def test_invalid_sections_are_rejected_without_cutting_their_contents(provider, 
 
 
 def test_total_body_budget_rejects_oversized_sections_without_truncation():
-    sections = normalized(summary_items(5, 5))
-    assert all(len(point) <= summarize.MAX_POINT_CHARS for section in sections for point in section["points"])
+    sections = normalized(explanatory_items(5, 5))
+    assert len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2 > 900
     with pytest.raises(summarize.SummaryError) as error:
         summarize.validate_summary_sections(sections)
     assert error.value.code == "validation_budget"
 
 
-@pytest.mark.parametrize("point", ["가" * 38, "가" + "A" * 41])
-def test_complete_explanation_is_kept_at_character_and_display_width_limits(point):
+@pytest.mark.parametrize("point", ["가" * 60, "가" + "A" * 80])
+def test_complete_explanation_is_not_rejected_for_artificial_per_line_limits(point):
     sections = normalized(summary_items(3, 3))
     sections[0]["points"][0] = point
     assert summarize.validate_summary_sections(sections)[0]["points"][0] == point
+
+
+def test_meaningful_five_theme_summary_over_old_budget_is_accepted(provider):
+    calls, responses = provider
+    items = explanatory_items()
+    sections = normalized(items)
+    units = len(summarize.summary_body_text(sections).encode("utf-16-le")) // 2
+    assert 600 < units <= 900
+    responses[:] = [Response(data=body(items))]
+    assert summarize.summarize_pdf(REPORT, PDF, 20) == sections
+    assert len(calls) == 1
+
+
+def test_headings_do_not_have_an_artificial_eighteen_character_limit():
+    sections = normalized()
+    sections[0]["heading"] = "고부가 산업의 수요 증가가 설비 투자에 미치는 영향"
+    assert summarize.validate_summary_sections(sections)[0]["heading"] == sections[0]["heading"]
+
+
+def test_budget_counts_numbering_bullets_blank_lines_and_utf16():
+    sections = [{"heading": f"주제 {i}", "points": [f"핵심 의미😀 {i}-{p}" for p in range(1, 4)]}
+                for i in range(1, 4)]
+    expected = "\n\n".join("\n".join([
+        f"{i}. {section['heading']}", *(f"• {point}" for point in section["points"]),
+    ]) for i, section in enumerate(sections, 1))
+    assert summarize.summary_body_text(sections) == expected
+    assert summarize._draft_summary_units({"sections": [
+        {"heading": section["heading"], "points": [{"text": point} for point in section["points"]]}
+        for section in sections
+    ]}) == len(expected.encode("utf-16-le")) // 2
 
 
 @pytest.mark.parametrize("point", ["성장\u2028설명", "성장\u200b설명", "1. 수요 증가"])
@@ -200,11 +233,11 @@ def test_hidden_line_breaks_and_pre_numbered_explanations_are_rejected(point):
     assert error.value.code == "validation_text"
 
 
-@pytest.mark.parametrize("problem", ["long", "duplicate", "count", "budget"])
+@pytest.mark.parametrize("problem", ["multiline", "duplicate", "count", "budget"])
 def test_one_ai_rewrite_can_fix_section_shape_or_length_semantically(provider, problem):
     calls, responses = provider
-    draft = summary_items(5, 5) if problem == "budget" else summary_items()
-    if problem == "long": draft[0]["points"][0]["text"] = "가" * 39
+    draft = explanatory_items(5, 5) if problem == "budget" else summary_items()
+    if problem == "multiline": draft[0]["points"][0]["text"] = "수요 증가\n생산 확대"
     elif problem == "duplicate": draft[1]["heading"] = draft[0]["heading"]
     elif problem == "count": draft.pop()
     responses[:] = [Response(data=body(draft)), Response()]
@@ -215,12 +248,25 @@ def test_one_ai_rewrite_can_fix_section_shape_or_length_semantically(provider, p
     assert json.loads(second["contents"][1]["parts"][0]["text"]) == {"sections": draft}
     assert "기계적으로 자르지" in second["contents"][2]["parts"][0]["text"]
     assert "원인·근거·의미" in second["contents"][2]["parts"][0]["text"]
+    if problem == "budget":
+        assert "앞선 요약의 실제 표시 길이는" in second["contents"][2]["parts"][0]["text"]
+
+
+def test_budget_rewrite_logs_only_lengths_and_codes(provider, caplog):
+    calls, responses = provider
+    draft = explanatory_items(5, 5)
+    responses[:] = [Response(data=body(draft)), Response()]
+    summarize.summarize_pdf(REPORT, PDF, 20)
+    assert "code=validation_budget" in caplog.text
+    assert "상한=900" in caplog.text
+    assert draft[0]["points"][0]["text"] not in caplog.text
+    assert API_KEY not in caplog.text
 
 
 def test_failed_rewrite_stops_after_two_requests_and_caches_nothing(provider):
     calls, responses = provider
     invalid = summary_items()
-    invalid[0]["points"][0]["text"] = "가" * 39
+    invalid[0]["points"][0]["text"] = "수요 증가\n생산 확대"
     responses[:] = [Response(data=body(invalid)), Response(data=body(invalid))]
     with pytest.raises(summarize.SummaryError) as error:
         summarize.summarize_pdf(REPORT, PDF, 20)

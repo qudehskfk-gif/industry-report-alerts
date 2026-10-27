@@ -61,7 +61,19 @@ def main() -> int:
             diagnostics.append(f"HTTP {exc.status_code}")
         if exc.reason:
             diagnostics.append(exc.reason)
-        print(f"요약 테스트를 완료하지 못했습니다 (SummaryError: {'; '.join(diagnostics)}). API 키와 무료 사용 한도를 확인하세요.")
+        if exc.code.startswith("validation_") or exc.code in {
+            "response_json", "response_schema", "response_incomplete",
+        }:
+            hint = "요약 응답의 형식·길이 검사를 확인하세요."
+        elif exc.code == "quota_429":
+            hint = "Gemini 프로젝트의 사용량 제한을 확인하세요."
+        elif exc.status_code is not None and exc.status_code >= 500:
+            hint = "요약 서비스의 일시적인 오류입니다."
+        elif exc.code == "transport_error":
+            hint = "요약 서비스 연결 또는 응답 시간을 확인하세요."
+        else:
+            hint = "표시된 오류 코드와 요약 서비스 설정을 확인하세요."
+        print(f"요약 테스트를 완료하지 못했습니다 (SummaryError: {'; '.join(diagnostics)}). {hint}")
         return 1
     except Exception as exc:
         print(f"요약 테스트를 완료하지 못했습니다 ({type(exc).__name__}). API 키와 무료 사용 한도를 확인하세요.")

@@ -1,5 +1,7 @@
 from dataclasses import replace
 from datetime import date
+import html
+import re
 
 import pytest
 
@@ -28,6 +30,11 @@ def section_summary(count=5, points=3):
          "points": [f"수요 변화의 원인과 의미 {index}-{point}" for point in range(1, points + 1)]}
         for index in range(1, count + 1)
     ]
+
+
+def visible_units(caption):
+    text = html.unescape(re.sub(r"<[^>]*>", "", caption))
+    return len(text.encode("utf-16-le")) // 2
 
 
 @pytest.fixture
@@ -80,7 +87,7 @@ def test_sectioned_summary_and_same_pdf_are_one_document_message(delivery, monke
     assert caption.count("\n• ") == section_count * point_count
     assert "10줄" not in caption and "(p." not in caption
     assert waits == []
-    assert len(caption.encode("utf-16-le")) // 2 <= 1024
+    assert visible_units(caption) <= 1024
 
 
 def test_disabled_summary_preserves_existing_pdf_delivery(delivery):
@@ -164,22 +171,85 @@ def test_long_metadata_is_reduced_before_complete_summary_and_html_is_escaped():
         section["heading"] = f"<수요 & 공급> {index}"
         section["points"] = [f"<기술 & 수익> 개선의 의미 {index}-{p}" for p in range(1, 4)]
     text = report_summary_caption(item, DECISION, summary)
-    assert len(text.encode("utf-16-le")) // 2 <= 1024
+    assert visible_units(text) <= 1024
     assert "&lt;수요 &amp; 공급&gt;" in text
     assert "&lt;기술 &amp; 수익&gt;" in text
     assert text.count("\n• ") == 15
     for index in range(1, 6):
         for point in range(1, 4):
             assert f"• &lt;기술 &amp; 수익&gt; 개선의 의미 {index}-{point}" in text
-    assert "원문 페이지" not in text
+    assert "원문 페이지" in text
+    assert item.detail_url in text
 
 
-def test_caption_overflow_rejects_summary_instead_of_truncating_content():
+def test_html_entity_expansion_does_not_discard_a_summary_that_fits():
     summary = section_summary()
     for index, section in enumerate(summary, 1):
         section["points"] = ["가" + "&" * 24 + f"{index}-{p}" for p in range(1, 4)]
-    with pytest.raises(TelegramError, match="PDF 설명 길이 제한"):
-        report_summary_caption(report(), DECISION, summary)
+    caption = report_summary_caption(report(), DECISION, summary)
+    assert len(caption.encode("utf-16-le")) // 2 > 1024
+    assert visible_units(caption) <= 1024
+    for index in range(1, 6):
+        for point in range(1, 4):
+            assert f"가{'&amp;' * 24}{index}-{point}" in caption
+
+
+@pytest.mark.parametrize("units", [1024, 1025])
+def test_caption_limit_counts_visible_utf16_and_preserves_whole_text(monkeypatch, units):
+    # Exercise the formatter's final Telegram guard independently of the
+    # provider's smaller budget reserved for report metadata.
+    summary = section_summary(3, 3)
+    visible_body = "\n\n".join(
+        "\n".join([f"{index}. {section['heading']}", *[f"• {point}" for point in section['points']]])
+        for index, section in enumerate(summary, 1)
+    )
+    used = len(visible_body.encode("utf-16-le")) // 2
+    padding = "가" * (units - used - 2) + "😀"
+    summary[-1]["points"][-1] += padding
+    monkeypatch.setattr("reportbot.telegram.validate_summary_sections", lambda sections: sections)
+    if units == 1025:
+        with pytest.raises(TelegramError, match="PDF 설명 길이 제한"):
+            report_summary_caption(report(), DECISION, summary)
+    else:
+        caption = report_summary_caption(report(), DECISION, summary)
+        assert visible_units(caption) == 1024
+        assert caption.endswith(padding)
+        assert caption.count("\n• ") == 9
+        assert "원문 페이지" not in caption
+        assert "테스트증권" not in caption
+
+
+def test_large_valid_summary_keeps_all_points_and_reduces_metadata_first():
+    summary = section_summary(5, 3)
+    for index, section in enumerate(summary, 1):
+        section["heading"] = f"반도체 산업 구조 변화의 원인과 전망을 설명하는 주제 {index}"
+        section["points"] = [
+            f"AI 수요 확대가 고부가 제품 공급과 기업 수익성에 미치는 영향을 분석 {index}-{point}"
+            for point in range(1, 4)
+        ]
+    item = report(title="매우 긴 산업 전망 보고서 제목 " * 30, broker="매우 긴 증권회사 이름 " * 20,
+                  sector="매우 긴 산업 섹터 이름 " * 20)
+    caption = report_summary_caption(item, DECISION, summary)
+    assert visible_units(caption) <= 1024
+    assert caption.count("\n• ") == 15
+    for section in summary:
+        assert section["heading"] in caption
+        for point in section["points"]:
+            assert point in caption
+
+
+@pytest.mark.parametrize("count,points", [(5, 3), (3, 5)])
+def test_provider_summary_budget_counts_the_exact_visible_caption_body(count, points):
+    from reportbot.summarize import summary_body_text
+
+    summary = section_summary(count, points)
+    summary[0]["heading"] = "AI & 수요 <전망> 😀"
+    summary[0]["points"][0] = "공급 < 수요이며 가격 & 이익의 변화도 함께 분석 😀"
+    caption = report_summary_caption(report(), DECISION, summary)
+    body_html = caption[caption.index("<b>1. "):].split('\n<a href="', 1)[0]
+    visible_body = html.unescape(re.sub(r"<[^>]*>", "", body_html))
+    assert visible_body == summary_body_text(summary)
+    assert visible_units(body_html) == len(summary_body_text(summary).encode("utf-16-le")) // 2
 
 
 def test_caption_formatting_failure_still_sends_pdf_and_redacts_error(delivery, monkeypatch, caplog):

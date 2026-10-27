@@ -156,6 +156,29 @@ def test_main_prints_only_fixed_summary_diagnostics(probe, monkeypatch, capsys):
     assert config.state_path.read_bytes() == original
 
 
+@pytest.mark.parametrize("code,status,hint", [
+    ("validation_budget", None, "요약 응답의 형식·길이 검사를 확인하세요."),
+    ("quota_429", 429, "Gemini 프로젝트의 사용량 제한을 확인하세요."),
+    ("http_503", 503, "요약 서비스의 일시적인 오류입니다."),
+    ("transport_error", None, "요약 서비스 연결 또는 응답 시간을 확인하세요."),
+])
+def test_main_gives_a_hint_for_the_actual_error_category(probe, monkeypatch, capsys, code, status, hint):
+    config, reports, pdf, calls, original = probe
+    monkeypatch.setattr(summary_test.Config, "from_env", lambda: config)
+
+    def fail(*args):
+        raise summary_test.SummaryError("private-provider-response", code=code, status_code=status)
+
+    monkeypatch.setattr(summary_test, "summarize_pdf", fail)
+    assert summary_test.main() == 1
+    output = capsys.readouterr().out
+    assert hint in output
+    assert "API 키와 무료 사용 한도를 확인하세요." not in output
+    assert "private-provider-response" not in output
+    assert calls == []
+    assert config.state_path.read_bytes() == original
+
+
 def test_failed_connection_check_stops_before_pdf_download(probe, monkeypatch, capsys):
     config, reports, pdf, calls, original = probe
     monkeypatch.setattr(summary_test.Config, "from_env", lambda: config)
