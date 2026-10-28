@@ -19,6 +19,16 @@ on:
         type: string
         required: false
         default: ''
+      resend:
+        description: '이미 발송한 PDF도 명시적으로 다시 보내기 (파일 지문·요청 번호 필수)'
+        type: boolean
+        required: false
+        default: false
+      request_id:
+        description: '재발송 요청 번호 (같은 번호는 한 번만 처리)'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -40,6 +50,8 @@ jobs:
       REPORT_SOURCE: ${{ inputs.source }}
       REPORT_ID: ${{ inputs.report_id }}
       EXPECTED_PDF_SHA256: ${{ inputs.expected_pdf_sha256 }}
+      ALLOW_RESEND: ${{ inputs.resend }}
+      RESEND_REQUEST_ID: ${{ inputs.request_id }}
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Check required secrets
@@ -68,7 +80,11 @@ jobs:
         timeout-minutes: 15
         shell: bash
         run: |
-          python -m reportbot.send_one --source "$REPORT_SOURCE" --report-id "$REPORT_ID" --expected-pdf-sha256 "$EXPECTED_PDF_SHA256"
+          selected_args=(--source "$REPORT_SOURCE" --report-id "$REPORT_ID" --expected-pdf-sha256 "$EXPECTED_PDF_SHA256")
+          if [[ "$ALLOW_RESEND" == "true" ]]; then
+            selected_args+=(--resend --request-id "$RESEND_REQUEST_ID")
+          fi
+          python -m reportbot.send_one "${selected_args[@]}"
       - name: Save notification history
         if: ${{ always() && steps.state.outputs.ready == 'true' }}
         timeout-minutes: 3
