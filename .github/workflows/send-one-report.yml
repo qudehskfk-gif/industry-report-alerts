@@ -1,0 +1,91 @@
+name: Send one selected report
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '리포트 출처'
+        type: choice
+        options:
+          - naver
+          - hankyung
+        required: true
+      report_id:
+        description: '등록 번호 (선택한 한 건만 검토·발송)'
+        type: string
+        required: true
+      expected_pdf_sha256:
+        description: '확인한 PDF의 SHA-256 (선택; 파일 변경 시 중단)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: industry-report-monitor
+  cancel-in-progress: false
+
+jobs:
+  send-one:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI }}
+      STATE_PATH: state-store/state.sqlite3
+      MIN_PDF_PAGES: '10'
+      REPORT_SOURCE: ${{ inputs.source }}
+      REPORT_ID: ${{ inputs.report_id }}
+      EXPECTED_PDF_SHA256: ${{ inputs.expected_pdf_sha256 }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check required secrets
+        shell: bash
+        run: |
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" || -z "$GEMINI_API_KEY" ]]; then
+            echo '::error::Telegram 연결과 Gemini 요약 Secret을 확인하세요.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - name: Restore notification history
+        id: state
+        shell: bash
+        run: |
+          git fetch --no-tags origin refs/heads/notification-state:refs/remotes/origin/notification-state
+          git worktree add --detach state-store refs/remotes/origin/notification-state
+          git -C state-store switch -c notification-state
+          test -f state-store/state.sqlite3
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Send only the selected undelivered PDF with summary
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          python -m reportbot.send_one --source "$REPORT_SOURCE" --report-id "$REPORT_ID" --expected-pdf-sha256 "$EXPECTED_PDF_SHA256"
+      - name: Save notification history
+        if: ${{ always() && steps.state.outputs.ready == 'true' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sqlite3
+          with sqlite3.connect('state-store/state.sqlite3') as database:
+              if database.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                  raise RuntimeError('SQLite state integrity check failed')
+          PY
+          git -C state-store config user.name 'github-actions[bot]'
+          git -C state-store config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C state-store add state.sqlite3
+          if git -C state-store diff --cached --quiet; then
+            echo '알림 기록에 변경이 없습니다.'
+            exit 0
+          fi
+          git -C state-store commit -m 'Record selected report delivery'
+          git -C state-store push origin HEAD:refs/heads/notification-state
