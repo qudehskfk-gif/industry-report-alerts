@@ -286,6 +286,72 @@ class State:
             keys.append(("pdf", pdf_hash))
         return any(self.db.execute("SELECT 1 FROM delivered WHERE kind=? AND fingerprint=?", key).fetchone() for key in keys)
 
+    def duplicate_pdf_match(self, pdf_hash: str | None) -> dict | None:
+        """Find delivery evidence for an identical PDF, independent of its title.
+
+        Publishers can attach the wrong PDF to a correctly titled listing.
+        Consequently a matching title alone cannot prove that its PDF was sent.
+        Legacy PDF fingerprints still prevent a resend, but do not invent a
+        title or delivery timestamp when the original receipt is unavailable.
+        """
+        if not isinstance(pdf_hash, str) or re.fullmatch(r"[0-9a-f]{64}", pdf_hash) is None:
+            return None
+        row = self.db.execute("""
+            SELECT source,source_id,title,processed_at FROM reports
+            WHERE outcome='sent' AND pdf_hash=?
+            ORDER BY processed_at,source,source_id LIMIT 1
+        """, (pdf_hash,)).fetchone()
+        if row:
+            return {"source": row[0], "source_id": row[1], "title": row[2],
+                    "processed_at": row[3], "pdf_hash": pdf_hash}
+        if self.db.execute("""
+            SELECT 1 FROM delivered WHERE kind='pdf' AND fingerprint=?
+        """, (pdf_hash,)).fetchone():
+            return {"source": None, "source_id": None, "title": None,
+                    "processed_at": None, "pdf_hash": pdf_hash}
+        return None
+
+    def requeue_unverified_duplicates(self, *, lookback_days: int = 45,
+                                     today: date | None = None) -> int:
+        """Recheck recent duplicates whose actual PDF delivery was never proved.
+
+        Title-only exclusions may hide different files under the same title.
+        Keep known identical PDFs terminal and preserve all original metadata
+        and timestamps. Repeated calls also cover later metadata hydration.
+        """
+        if type(lookback_days) is not int or lookback_days < 1:
+            raise ValueError("Report lookback days must be positive")
+        if today is None:
+            today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        if type(today) is not date:
+            raise ValueError("A report recheck date is required")
+        cutoff = today - timedelta(days=lookback_days)
+        candidates = []
+        for source, source_id, raw, digest in self.db.execute("""
+            SELECT source,source_id,metadata_json,pdf_hash FROM reports
+            WHERE outcome='duplicate' AND metadata_json IS NOT NULL
+        """).fetchall():
+            if self.duplicate_pdf_match(digest) is not None:
+                continue
+            try:
+                report = self._decode(raw)
+            except (ValueError, TypeError, KeyError):
+                continue
+            if (report.source, report.source_id) != (source, source_id):
+                continue
+            if report.category != "industry" or not cutoff <= report.published_date <= today:
+                continue
+            candidates.append((source, source_id))
+        changed = 0
+        with self.db:
+            for source, source_id in candidates:
+                result = self.db.execute("""
+                    UPDATE reports SET outcome='pending'
+                    WHERE source=? AND source_id=? AND outcome='duplicate'
+                """, (source, source_id))
+                changed += result.rowcount
+        return changed
+
     def record(self, report: Report, outcome: str, pdf_hash: str | None = None,
                *, summary_job: dict | None = None):
         receipt = None

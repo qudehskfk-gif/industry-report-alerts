@@ -125,15 +125,21 @@ def test_duplicates_are_reported_separately_from_condition_rejections(run_report
     first = report("100", title="같은 산업 보고서")
     mirror = report("101", title=first.title if duplicate_kind == "title" else "다른 제목의 같은 PDF")
     state = State(config.state_path)
-    state.record(first, "sent", "shared-pdf")
+    digest = "a" * 64
+    state.record(first, "sent", digest)
     state.close()
     monkeypatch.setattr(runner, "SOURCES", {"hankyung": lambda *args, **kw: [first, mirror]})
-    monkeypatch.setattr(runner, "classify", lambda *args: Decision(True, "산업 리포트 15쪽", 15, "shared-pdf"))
+    monkeypatch.setattr(runner, "classify", lambda *args: Decision(True, "산업 리포트 15쪽", 15, digest))
     assert runner.check(config) == 0
     summary = events.summaries[0]
     assert summary["reviewed"] == 1
     assert summary["totals"]["duplicates"] == 1
-    assert summary["duplicates"] == [(mirror, "이미 발송한 제목 또는 동일 PDF")]
+    assert len(summary["duplicates"]) == 1
+    item, reason = summary["duplicates"][0]
+    assert item == mirror
+    assert "PDF와 파일 내용이 완전히 같습니다" in reason
+    assert f"기존 발송 제목: 「{first.title}」" in reason
+    assert "발송 시각:" in reason and "한국시간" in reason
     assert summary["rejected"] == []
     assert events.sent == []
 

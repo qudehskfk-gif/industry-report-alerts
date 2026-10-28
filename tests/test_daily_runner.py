@@ -148,15 +148,16 @@ def test_preview_saves_pending_but_does_not_turn_qualified_reports_into_deliveri
         "hankyung": lambda *a, **kw: [first],
         "naver": lambda *a, **kw: [mirror],
     })
-    monkeypatch.setattr(runner, "classify", lambda *a: Decision(True, "산업 리포트 25쪽", 25, "same-pdf"))
+    digest = "a" * 64
+    monkeypatch.setattr(runner, "classify", lambda *a: Decision(True, "산업 리포트 25쪽", 25, digest))
     sent = capture_sends(monkeypatch)
     assert runner.check(config, preview_only=True) == 0
     assert sent == []
     state = State(config.state_path)
     try:
         assert set(state.pending()) == {first, mirror}
-        assert not state.duplicate(first, "same-pdf")
-        assert not state.duplicate(mirror, "same-pdf")
+        assert not state.duplicate(first, digest)
+        assert not state.duplicate(mirror, digest)
     finally:
         state.close()
     # Actual delivery suppresses the mirror only after the first PDF was accepted.

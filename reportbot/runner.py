@@ -2,7 +2,7 @@ import logging
 import os
 from collections import Counter
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .classify import Decision, classify, inspect_pdf, title_rejection
@@ -10,7 +10,7 @@ from .config import Config
 from .http import make_session
 from .sources import hankyung, naver
 from .sources.shinhan import SingleCompanyReport
-from .state import State, summary_destination_key, title_fingerprint
+from .state import State, summary_destination_key
 from .summarize import SummaryError
 from .telegram import Telegram, TelegramError
 
@@ -103,6 +103,26 @@ def _summary_receipt(result, config):
             "error_code": result.get("_reportbot_summary_error", "summary_error")}
 
 
+def _duplicate_pdf_reason(match: dict) -> str:
+    """Explain the actual matching delivery without assuming listing titles agree."""
+    reason = "이미 발송한 PDF와 파일 내용이 완전히 같습니다."
+    title = match.get("title")
+    if title:
+        reason += f" 기존 발송 제목: 「{title}」."
+    recorded = match.get("processed_at")
+    if recorded:
+        try:
+            instant = datetime.fromisoformat(recorded.replace("Z", "+00:00"))
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=timezone.utc)
+            sent_at = instant.astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M")
+            reason += f" 발송 시각: {sent_at} (한국시간)."
+        except (TypeError, ValueError, OverflowError):
+            # Old fingerprint-only records may not carry a usable receipt.
+            pass
+    return reason
+
+
 def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) -> int:
     started_at = datetime.now(ZoneInfo("Asia/Seoul"))
     preview = dry_run or preview_only
@@ -112,8 +132,7 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
     state = None if dry_run else State(config.state_path)
     totals = {"sent": 0, "linked": 0, "rejected": 0, "duplicates": 0, "ready": 0, "pending": 0,
               "summaries_updated": 0, "summaries_deferred": 0, "summaries_failed": 0}
-    preview_titles = set()
-    preview_hashes = set()
+    preview_hashes = {}
     report_failures = []
     rejected_reports = []
     duplicate_reports = []
@@ -129,6 +148,11 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                 )
                 if reopened:
                     log.info("최소 쪽수 기준 변경으로 기존 제외 자료 %d건 재검사 예약", reopened)
+                reopened_duplicates = state.requeue_unverified_duplicates(
+                    lookback_days=config.scan_lookback_days,
+                )
+                if reopened_duplicates:
+                    log.info("실제 PDF 중복이 확인되지 않은 기존 제외 자료 %d건 재검사 예약", reopened_duplicates)
             if telegram is not None:
                 # Process old jobs before recording new failed summaries, so an
                 # exhausted provider is not immediately retried in the same run.
@@ -150,11 +174,6 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                     totals["rejected"] += 1
                     rejected_reports.append((report, rejection))
                     continue
-                if state is not None and state.duplicate(report):
-                    state.record(report, "duplicate")
-                    totals["duplicates"] += 1
-                    duplicate_reports.append((report, "이미 발송한 제목 또는 동일 PDF"))
-                    continue
                 failure_reason = "PDF 원문 주소를 확인하지 못했습니다."
                 try:
                     report = resolve(report, session)
@@ -168,20 +187,24 @@ def check(config: Config, *, dry_run: bool = False, preview_only: bool = False) 
                         totals["rejected"] += 1
                         rejected_reports.append((report, decision.reason))
                         continue
-                    if state is not None and state.duplicate(report, decision.pdf_hash):
+                    # A publisher can attach a different PDF under the same
+                    # listing title. Only the downloaded file can prove a
+                    # duplicate; title matches must never skip inspection.
+                    duplicate_match = (state.duplicate_pdf_match(decision.pdf_hash)
+                                       if state is not None else None)
+                    if duplicate_match is not None:
                         state.record(report, "duplicate", decision.pdf_hash)
                         totals["duplicates"] += 1
-                        duplicate_reports.append((report, "이미 발송한 제목 또는 동일 PDF"))
+                        duplicate_reports.append((report, _duplicate_pdf_reason(duplicate_match)))
                         continue
-                    fingerprint = title_fingerprint(report)
                     if preview:
-                        if fingerprint in preview_titles or (decision.pdf_hash and decision.pdf_hash in preview_hashes):
+                        if decision.pdf_hash and decision.pdf_hash in preview_hashes:
                             totals["duplicates"] += 1
-                            duplicate_reports.append((report, "이번 미리보기에서 확인한 중복 제목 또는 동일 PDF"))
+                            original = preview_hashes[decision.pdf_hash]
+                            duplicate_reports.append((report, f"이번 미리보기에서 확인한 동일 PDF. 대표 자료: 「{original.title}」."))
                             continue
-                        preview_titles.add(fingerprint)
                         if decision.pdf_hash:
-                            preview_hashes.add(decision.pdf_hash)
+                            preview_hashes[decision.pdf_hash] = report
                         totals["ready"] += 1
                         log.info("[발송 대기 PDF] %s/%s | %s | %s | %s | %s", report.source, report.source_id, report.title, report.broker, report.published_date, decision.reason)
                     else:
